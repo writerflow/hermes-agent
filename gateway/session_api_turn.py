@@ -277,14 +277,42 @@ def owns_api_run(adapter, run_id, owner_scope):
     return _valid_owner_scope(stored) and hmac.compare_digest(stored, owner_scope)
 
 
-def recover_api_turns(adapter):
+async def prepare_api_recovery(adapter):
+    """Read each serving profile's scope in a worker, before the adapter is published; touches no
+    gateway state. Keyed by ``id(authority)``. An authority whose read fails gets no entry, and
+    ``recover_api_turns`` falls back to the sync scope for it (one profile degrades, not the publish)."""
+    import logging
+    from gateway.session_authorities import prepare_owner_scope, serving_authorities
+    prepared = {}
+    for authority in serving_authorities(adapter.gateway_runner):
+        try:
+            prepared[id(authority)] = await prepare_owner_scope(authority)
+        except Exception:
+            logging.getLogger('gateway.run').warning(
+                "API recovery: could not prepare the scope of %s off the loop; it recovers under the sync scope",
+                getattr(authority, 'profile_id', '?'), exc_info=True)
+    return prepared
+
+
+def recover_api_turns(adapter, prepared=None):
     """Recover committed work only after the real API adapter is published. A parked profile's
-    retained (retiring) authority is not served: its store is never read here."""
-    from gateway.session_authorities import owner_scope, serving_authorities
+    retained (retiring) authority is not served: its store is never read here. ``prepared`` is
+    ``prepare_api_recovery``'s result: with it no profile file is read here; an authority it does not
+    cover (added meanwhile, or its preparation failed) takes the sync scope with a warning."""
+    import logging
+    from gateway.session_authorities import bind_prepared_owner_scope, owner_scope, serving_authorities
     for authority in serving_authorities(adapter.gateway_runner):
         # Startup is unscoped (the launch profile's home): each profile's media root, config and
         # API bindings must pair with its own state.db, never the launch profile's.
-        with owner_scope(authority):
+        if prepared is not None and id(authority) in prepared:
+            scope = bind_prepared_owner_scope(authority, prepared[id(authority)])
+        else:
+            if prepared is not None:
+                logging.getLogger('gateway.run').warning(
+                    "API recovery: no prepared scope for %s; recovering under the sync scope",
+                    getattr(authority, 'profile_id', '?'))
+            scope = owner_scope(authority)
+        with scope:
             recover_authority_api_turns(adapter, authority)
 
 
