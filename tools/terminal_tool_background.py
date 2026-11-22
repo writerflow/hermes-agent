@@ -10,6 +10,8 @@ import logging
 import sys
 from typing import Any, List, Optional
 
+from tools.foreground_scope import scope_unit_of as _scope_unit_of
+
 logger = logging.getLogger("tools.terminal_tool")
 
 # A silent background process (no notify_on_complete / watch_patterns) is right
@@ -278,7 +280,7 @@ def yield_to_background_handler(
             owner_task_id=task_id or effective_task_id, session_key=session_key,
             output_so_far=output_so_far)
         # The command's own foreground scope goes with it, so a later kill reaps the whole scope.
-        session.systemd_unit = getattr(proc, "_hermes_scope_unit", "")
+        session.systemd_unit = _scope_unit_of(proc)
         _stamp_routing_if_gateway(process_registry, session, session_key)
         logger.info("foreground command yielded to background as %s (pid %s)", session.id, session.pid)
         return {

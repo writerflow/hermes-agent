@@ -1277,10 +1277,9 @@ class LocalEnvironment(BaseEnvironment):
         started is never re-run. A scoped result is marked so ``_update_cwd`` can add the limit note."""
         try:
             result = super()._wait_for_process(proc, *args, **kwargs)
-            retry = getattr(proc, "_hermes_scope_retry", None)
-            if retry is None:
+            if not foreground_scope.scope_unit_of(proc):
                 return result
-            cmd_string, login, timeout, stdin_data, spawn_env = retry
+            cmd_string, login, timeout, stdin_data, spawn_env = proc._hermes_scope_retry
             if foreground_scope.scope_never_started(result.get("returncode"), result.get("output", ""), self._cwd_marker):
                 foreground_scope.warn_bus_lost(spawn_env)
                 fallback = self._run_bash(cmd_string, login=login, timeout=timeout, stdin_data=stdin_data)
@@ -1319,7 +1318,7 @@ class LocalEnvironment(BaseEnvironment):
         except OSError:  # ProcessLookupError / PermissionError included
             with contextlib.suppress(Exception):
                 proc.kill()
-        if unit := getattr(proc, "_hermes_scope_unit", None):
+        if unit := foreground_scope.scope_unit_of(proc):
             foreground_scope.stop_scope(unit)
 
     def _update_cwd(self, result: dict):
