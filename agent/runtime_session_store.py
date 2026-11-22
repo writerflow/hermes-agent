@@ -23,7 +23,7 @@ from websockets.exceptions import ConnectionClosed
 logger = logging.getLogger(__name__)
 
 RECEIPT_ATTEMPT_TIMEOUT_S = 20.0
-OWNER_SILENCE_BUDGET_S = 180.0
+OWNER_SILENCE_BUDGET_S = 420.0
 STARTUP_REPLAY_BUDGET_S = 30.0
 _monotonic = time.monotonic
 
