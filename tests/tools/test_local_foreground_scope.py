@@ -248,19 +248,15 @@ def fg_config(tmp_path):
     """``fg_config(enabled=True, gradle_daemon=None)`` writes the profile config.yaml the real reader sees."""
     from hermes_constants import get_hermes_home
 
-    def write(enabled: bool = True, gradle_daemon: str | None = None, raw: str | None = None) -> None:
-        section: dict = {"enabled": enabled}
+    def write(enabled: bool = True, gradle_daemon: str | None = None, raw: str | None = None, **extra) -> None:
+        section: dict = {"enabled": enabled, **extra}
         if gradle_daemon is not None:
             section["gradle_daemon"] = gradle_daemon
-        text = raw if raw is not None else _yaml({"terminal": {"foreground_scope": section}})
-        (get_hermes_home() / "config.yaml").write_text(text)
+        lines = ["terminal:", "  foreground_scope:"]
+        lines += [f"    {key}: {json.dumps(value)}" for key, value in section.items()]  # JSON scalars are YAML
+        (get_hermes_home() / "config.yaml").write_text(raw if raw is not None else "\n".join(lines) + "\n")
 
     return write
-
-
-def _yaml(data: dict) -> str:
-    import yaml
-    return yaml.safe_dump(data)
 
 
 @pytest.fixture()
@@ -480,7 +476,7 @@ class TestPropertySet:
 
     def test_no_memory_max_code_path(self, worker_host, stub, fg_config, make_env):
         """A leftover ``memory_max_mb`` key is ignored: no MemoryMax reaches the scope, however configured."""
-        fg_config(raw=_yaml({"terminal": {"foreground_scope": {"enabled": True, "memory_max_mb": 4096}}}))
+        fg_config(memory_max_mb=4096)
         make_env().execute("echo hi", resource_scope=True)
         (call,) = stub.calls()
         assert not any("MemoryMax" in element for element in call.argv), call.argv
@@ -639,15 +635,22 @@ class TestFallbackIsByteIdentical:
         monkeypatch.setattr(subprocess, "Popen", spy)
         return seen
 
+    @staticmethod
+    def _command_call(popen_spy):
+        """The spawn that carries the test's command (other spawns, probes or cleanup, are not under test)."""
+        (call,) = [c for c in popen_spy if "echo hi" in c["args"][-1]][-1:]
+        popen_spy.clear()
+        return call
+
     def _golden(self, make_env, popen_spy):
         """What today's ``_run_bash`` spawns for the same command: no resource_scope keyword at all."""
         make_env().execute("echo hi")
-        return popen_spy.pop()
+        return self._command_call(popen_spy)
 
     def _assert_unchanged(self, make_env, popen_spy, stub):
         golden = self._golden(make_env, popen_spy)
         assert make_env().execute("echo hi", resource_scope=True)["returncode"] == 0
-        scoped_call = popen_spy.pop()
+        scoped_call = self._command_call(popen_spy)
         assert scoped_call["args"][:2] == golden["args"][:2]
         assert scoped_call["env"] == golden["env"]
         assert scoped_call["cwd"] == golden["cwd"]
