@@ -289,6 +289,10 @@ class BaseEnvironment(LongLivedProcessMixin, ABC):
     # (LocalEnvironment); controller-host facts then describe the execution target.
     is_local: bool = False
 
+    # True when _run_bash accepts ``resource_scope=`` (run the command in its own capped systemd scope).
+    # Only LocalEnvironment; execute() never passes the keyword to a backend that leaves this False.
+    supports_resource_scope: bool = False
+
     # True when the file tools may read, write, patch and search this backend's files straight on
     # the host instead of through execute() (only LocalEnvironment). A host backend that confines its
     # commands (a sandbox hiding paths, mounting them read-only or giving them their own $TMPDIR) sets
@@ -714,8 +718,11 @@ class BaseEnvironment(LongLivedProcessMixin, ABC):
         stdin_data: str | None = None,
         rewrite_compound_background: bool = True,
         bounded_capture: bool = False,
-        yield_handler: Callable[[ProcessHandle, str], dict] | None = None) -> dict:
-        """Execute a command, return {"output": str, "returncode": int}. ``bounded_capture=True``
+        yield_handler: Callable[[ProcessHandle, str], dict] | None = None,
+        resource_scope: bool = False) -> dict:
+        """Execute a command, return {"output": str, "returncode": int}. ``resource_scope=True`` (foreground
+        terminal tool only) asks a backend with ``supports_resource_scope`` to run it in its own capped scope;
+        other backends ignore it. ``bounded_capture=True``
         caps retention at ``tool_output.max_bytes`` WHILE draining; only the foreground terminal
         tool may set it — internal full-fidelity consumers (file-op ``cat`` reads feeding the
         patch engine, RPC reads, log reads) MUST leave it False or data is corrupted. The wait is
@@ -766,7 +773,9 @@ class BaseEnvironment(LongLivedProcessMixin, ABC):
                 return {"output": "[host is exiting: command not started]", "returncode": 130}
             spawned = None
             try:
-                spawned = self._run_bash(wrapped, login=login, timeout=effective_timeout, stdin_data=effective_stdin)
+                scope_kwargs = {"resource_scope": True} if resource_scope and self.supports_resource_scope else {}
+                spawned = self._run_bash(wrapped, login=login, timeout=effective_timeout, stdin_data=effective_stdin,
+                                         **scope_kwargs)
             finally:
                 fenced = _leave_foreground_spawn(self, spawned)
             proc_holder.append(spawned)
