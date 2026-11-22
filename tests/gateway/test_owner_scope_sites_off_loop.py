@@ -172,3 +172,115 @@ async def test_site_session_controls_close_detaches_under_the_owners_scope(tmp_p
     await conn.close()
     assert seen == [expected]
     assert expected["home"] == str(home)
+
+
+# --- Row 11: API-turn recovery on adapter publication (11a reconnect, 11b startup) -------------------
+
+class _PublishRunner:
+    """Only the state the real publish, reconnect-install and startup-aggregate bodies read."""
+
+    def __init__(self, authorities, order):
+        from gateway.config import Platform
+        from gateway.run_adapters import GatewayAdapterLifecycleMixin
+        from gateway.run_startup import GatewayStartupMixin
+
+        self.order = order
+        self.adapters = {}
+        self.delivery_router = SimpleNamespace(adapters=None)
+        self._failed_platforms = {Platform.API_SERVER: {"predecessor": None}}
+        self.session_authorities = SimpleNamespace(serving=lambda: list(authorities))
+        self.status_updates = []
+        self.safe_disconnects = []
+        cls = type(self)
+        for name in ("_publish_primary_adapter", "_install_reconnected_adapter", "_prepare_primary_adapter"):
+            if hasattr(GatewayAdapterLifecycleMixin, name):
+                setattr(cls, name, getattr(GatewayAdapterLifecycleMixin, name))
+        for name in ("_start_aggregate_connect_results", "_startup_queue_transient_failure", "_startup_retry_entry"):
+            setattr(cls, name, getattr(GatewayStartupMixin, name))
+
+    def _sync_voice_mode_state_to_adapter(self, adapter):
+        self.order.append("voice_sync")
+
+    def _bind_voice_input_callback(self, adapter):
+        self.order.append("voice_bind")
+
+    def _update_platform_runtime_status(self, name, **kw):
+        self.status_updates.append((name, kw))
+
+    def _schedule_restart_notice_replay(self):
+        pass
+
+    async def _redeliver_failed_obligations_for_platform(self, platform):
+        pass
+
+    def _schedule_resume_pending_sessions(self, platform=None):
+        return 0
+
+    async def _safe_adapter_disconnect(self, adapter, platform):
+        self.safe_disconnects.append(adapter)
+        await adapter.disconnect()
+
+
+class _ApiAdapter:
+    send_path_degraded = False
+    has_fatal_error = False
+    fatal_error_retryable = True
+    DEGRADED_STATUS_MESSAGE = ""
+
+    def __init__(self):
+        self.disconnects = 0
+
+    async def disconnect(self):
+        self.disconnects += 1
+
+
+def _publish_world(tmp_path, monkeypatch, names=("alpha", "beta")):
+    from gateway import run_adapters, session_api_turn
+    from gateway import channel_directory
+    homes = [_make_home(tmp_path, name) for name in names]
+    authorities = [_authority(home) for home in homes]
+    order, recovered, handed = [], [], []
+
+    def recover(adapter, authority):
+        order.append("recover")
+        recovered.append((authority, threading.get_ident(), _bound()["home"]))
+
+    monkeypatch.setattr(session_api_turn, "recover_authority_api_turns", recover)
+    monkeypatch.setattr(run_adapters, "hand_over_held_inbound", lambda *a: handed.append(a))
+
+    async def no_directory(_adapters):
+        return None
+
+    monkeypatch.setattr(channel_directory, "build_channel_directory", no_directory)
+    runner = _PublishRunner(authorities, order)
+    adapter = _ApiAdapter()
+    adapter.gateway_runner = runner
+    return runner, adapter, homes, authorities, order, recovered, handed
+
+
+@pytest.mark.asyncio
+async def test_site_api_recover_reconnect_reads_each_profile_off_the_loop(tmp_path, reads, n0, monkeypatch):
+    from gateway.config import Platform
+    runner, adapter, homes, _auth, order, recovered, _handed = _publish_world(tmp_path, monkeypatch)
+    loop_ident = threading.get_ident()
+    await runner._install_reconnected_adapter(Platform.API_SERVER, adapter)
+    for home in homes:
+        _assert_reach(reads, home, n0)
+        _assert_off_loop(reads, home, loop_ident)
+    assert runner.adapters[Platform.API_SERVER] is adapter
+    assert [(ident == loop_ident) for _a, ident, _h in recovered] == [True, True]
+    assert [h for _a, _i, h in recovered] == [str(home) for home in homes]
+
+
+@pytest.mark.asyncio
+async def test_site_api_recover_startup_reads_each_profile_off_the_loop(tmp_path, reads, n0, monkeypatch):
+    from gateway.config import Platform
+    runner, adapter, homes, _auth, order, recovered, _handed = _publish_world(tmp_path, monkeypatch)
+    loop_ident = threading.get_ident()
+    count = await runner._start_aggregate_connect_results(
+        [(Platform.API_SERVER, adapter, object(), "ok", None)], [], [])
+    assert count == 1 and runner.adapters[Platform.API_SERVER] is adapter
+    for home in homes:
+        _assert_reach(reads, home, n0)
+        _assert_off_loop(reads, home, loop_ident)
+    assert [(ident == loop_ident) for _a, ident, _h in recovered] == [True, True]
