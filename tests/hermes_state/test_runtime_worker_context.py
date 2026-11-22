@@ -6,7 +6,7 @@ from hermes_state import SessionDB
 from hermes_state_runtime import begin_runtime_epoch, mutate_worker_execution, register_worker_execution
 
 
-def test_worker_context_preserves_authority_identity_and_prompt_receipts(tmp_path):
+def test_worker_context_preserves_authority_identity_and_prompt_receipts(tmp_path, monkeypatch):
     db = SessionDB(tmp_path / 'state.db')
     try:
         db.create_session('owned', 'subagent', parent_session_id=None, model='requested',
@@ -25,6 +25,8 @@ def test_worker_context_preserves_authority_identity_and_prompt_receipts(tmp_pat
             assert store.get_session_model_config_value('owned', '_usage_anchor') == {'tokens': 23}
             assert db.get_session_model_config_value('owned', '_delegate_from') == 'parent'
             assert db.get_session('foreign')['system_prompt'] == 'private'
+            # A lost ack is retried for the owner-silence budget; this test is about the pending receipt, not the wait.
+            monkeypatch.setattr('agent.runtime_session_store.OWNER_SILENCE_BUDGET_S', 0.0)
             original = store.rpc
             def lost_ack(method, **params):
                 original(method, **params)
