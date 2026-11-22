@@ -7,6 +7,31 @@ import subprocess
 import pytest
 
 from hermes_cli import update_cmd_commit, update_cmd_posix_pause as pause
+from tools import process_registry
+
+
+@pytest.mark.platforms("linux")
+@pytest.mark.parametrize("stderr", [b"OOMPolicy refused", b""])
+def test_failed_retained_scope_probe_cannot_degrade_on_warm_cache(monkeypatch, stderr):
+    monkeypatch.setenv("INVOCATION_ID", "fixture-invocation")
+    monkeypatch.setattr(process_registry, "_is_supervised_gateway_process", lambda: True)
+    monkeypatch.setattr(process_registry, "_SYSTEMD_SCOPE_AVAILABLE", None)
+    monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/systemd-run")
+
+    probes = []
+
+    def manager(argv, **kwargs):
+        probes.append(argv)
+        return subprocess.CompletedProcess(argv, 1, b"", stderr)
+
+    monkeypatch.setattr(process_registry.subprocess, "run", manager)
+    for _ in range(2):
+        with pytest.raises(process_registry.RestartSafeScopeUnavailable, match="OOMPolicy"):
+            process_registry.restart_safe_gateway_child_argv(
+                ["payload"], unit_suffix="warm-probe", require_restart_safe_scope=False,
+            )
+    assert len(probes) == 1
+    assert "OOMPolicy=continue" in probes[0]
 
 
 @pytest.mark.platforms("linux")

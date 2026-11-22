@@ -2470,12 +2470,7 @@ class TestSystemdCgroupIsolation:
         assert first is True
         assert second is True
         assert len(probe_calls) == 1, "probe must run only once (cached)"
-        # The probe must not carry OOMPolicy= either: that is the argv systemd
-        # rejected on scope units and cached as "unavailable" (#102486).
-        probe_argv = probe_calls[0][0]
-        assert not any(
-            value.startswith("OOMPolicy=") for value in probe_argv if isinstance(value, str)
-        ), probe_argv
+        assert "OOMPolicy=continue" in probe_calls[0][0]
 
     @pytest.mark.platforms("linux")
     @pytest.mark.parametrize("rejects_no_expand", [False, True], ids=["systemd>=254", "systemd<254"])
@@ -2528,7 +2523,8 @@ class TestSystemdCgroupIsolation:
 
         assert pr._systemd_run_user_scope_available() is True
         clock[0] += 61
-        assert pr._systemd_run_user_scope_available() is False
+        with pytest.raises(pr.RestartSafeScopeUnavailable, match="OOMPolicy"):
+            pr._systemd_run_user_scope_available()
         assert len(probe_calls) == 2
 
     @pytest.mark.platforms("linux")
@@ -2619,8 +2615,8 @@ class TestSystemdCgroupIsolation:
         assert pr._SYSTEMD_SCOPE_AVAILABLE is False
 
     @pytest.mark.platforms("linux")
-    def test_probe_succeeds_without_bin_true(self, monkeypatch):
-        """An absent ``/bin/true`` must not make a usable scope fail its probe."""
+    def test_probe_payload_without_scope_membership_refuses(self, monkeypatch):
+        """Running the inert payload is not proof that systemd placed it."""
         import tools.process_registry as pr
 
         monkeypatch.setattr(pr, "_SYSTEMD_SCOPE_AVAILABLE", None)
@@ -2628,19 +2624,19 @@ class TestSystemdCgroupIsolation:
         real_run = subprocess.run
         executed = []
 
-        def systemd_run_on_nixos_shaped_root(argv, **kwargs):
-            # Simulate NixOS's missing executable, but run the selected replacement.
+        def systemd_run_without_placement(argv, **kwargs):
             payload = argv[argv.index("--") + 1 :]
-            if payload[0] == "/bin/true":
-                return subprocess.CompletedProcess(payload, 127, stderr=b"No such file or directory")
             executed.append(payload)
-            return real_run(payload, **kwargs)
+            result = real_run(payload, **kwargs)
+            assert result.returncode == 1 and not result.stderr, result
+            return result
 
         monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/systemd-run")
-        monkeypatch.setattr("subprocess.run", systemd_run_on_nixos_shaped_root)
+        monkeypatch.setattr("subprocess.run", systemd_run_without_placement)
 
-        assert pr._systemd_run_user_scope_available() is True
-        assert len(executed) == 1, "payload must really run (exit 0) on the host, not just be spelled right"
+        with pytest.raises(pr.RestartSafeScopeUnavailable, match="OOMPolicy"):
+            pr._systemd_run_user_scope_available()
+        assert len(executed) == 1
 
     @pytest.mark.platforms("linux")
     def test_systemd_scope_first_probe_is_serialized(self, monkeypatch):
@@ -2710,8 +2706,9 @@ class TestSystemdCgroupIsolation:
         monkeypatch.setattr("tools.process_registry.time.monotonic", lambda: clock[0])
         monkeypatch.setattr("subprocess.run", fake_run)
 
-        assert pr._systemd_run_user_scope_available() is False
-        assert pr._systemd_run_user_scope_available() is False
+        for _ in range(2):
+            with pytest.raises(pr.RestartSafeScopeUnavailable, match="OOMPolicy"):
+                pr._systemd_run_user_scope_available()
         assert len(probe_calls) == 1
 
         clock[0] += 61

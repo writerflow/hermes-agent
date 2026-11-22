@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import json
 import subprocess
+import sys
 import time
+from enum import Enum
+from pathlib import Path
 
 SYSTEMD = "org.freedesktop.systemd1"
 MANAGER = SYSTEMD + ".Manager"
@@ -16,6 +19,10 @@ OOM_POLICY = "continue"
 
 class ScopeVerificationError(RuntimeError):
     """A systemd scope could not be verified; do not release the held work."""
+
+
+class ScopeProbeFailure(Enum):
+    UNVERIFIED_POLICY = "scope probe could not verify OOMPolicy=continue"
 
 
 class ScopeBus:
@@ -89,3 +96,23 @@ class ScopeBus:
         if self.scope_identity(name, membership) != (path, invocation):
             raise ScopeVerificationError("systemd scope invocation changed during OOMPolicy verification")
         self.verify_owner()
+
+
+def probe_payload(name: str) -> list[str]:
+    return [sys.executable, "-I", "-m", "tools.work_scope", name]
+
+
+def _verify_inert_probe(name: str) -> int:
+    try:
+        lines = Path("/proc/self/cgroup").read_text(encoding="utf-8").splitlines()
+        membership = next((line[3:] for line in lines if line.startswith("0::")), "")
+        if not membership or membership.rsplit("/", 1)[-1] != name:
+            return 1
+        ScopeBus("--user", time.monotonic() + 2).verify_scope(name, membership)
+    except (ScopeVerificationError, OSError):
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(_verify_inert_probe(sys.argv[1]) if len(sys.argv) == 2 else 1)
