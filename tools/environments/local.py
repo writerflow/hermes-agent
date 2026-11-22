@@ -19,7 +19,8 @@ from pathlib import Path
 
 from hermes_constants import get_process_hermes_home
 from tools.environments.base import BaseEnvironment, _SHELL_ENV_NAME_RE
-from tools.environments.base_output import _pipe_stdin
+from tools.environments.base_output import _new_output_collector, _pipe_stdin
+from tools import foreground_scope
 from hermes_cli._subprocess_compat import windows_hide_flags
 from hermes_cli.process_identity import own_process_groups, release_process_groups
 from gateway.bridged_env import BRIDGED_ENV_MARKER_PREFIX, bridged_env_digest, drop_bridge_markers
@@ -1234,6 +1235,9 @@ class LocalEnvironment(BaseEnvironment):
             cmd_string = _prepend_shell_init(cmd_string, _resolve_shell_init_files())
         args = [bash, *(["-l"] if login else []), "-c", cmd_string]
         self._recover_cwd()
+        scoped = foreground_scope.scope_command(args, run_env) if resource_scope and not _IS_WINDOWS else None
+        if scoped is not None:
+            args, run_env = scoped.argv, scoped.env
         # Not spawn_owned: an awaited command needs no spawn-ledger entry; own_process_groups below hands
         # its group to the owner-death supervisor and _wait_for_process releases it.
         proc = subprocess.Popen(
@@ -1243,6 +1247,10 @@ class LocalEnvironment(BaseEnvironment):
             # detached-spawn: ok — owned via own_process_groups right below
             start_new_session=True, cwd=self.cwd,
             **({"creationflags": windows_hide_flags()} if _IS_WINDOWS else {}))
+        if scoped is not None:
+            # The wrapper execs in place: the Popen pid, group and start time are the command's own.
+            proc._hermes_scope_unit = scoped.unit
+            proc._hermes_scope_retry = (cmd_string, login, timeout, stdin_data, run_env)
         if not _IS_WINDOWS:
             # The command dies with this process however it dies: a SIGKILLed / OOM-killed host left a
             # running `npm run dev` or `sleep` on init. Released once the wait returns (see below).
@@ -1264,9 +1272,23 @@ class LocalEnvironment(BaseEnvironment):
         """Base wait, then hand the command's group back from the owner-death supervisor: once the
         command returned, what it left running in the background (`server &`) is not ours to kill,
         exactly as on a graceful exit. A command that yielded to background took the group with it
-        (``ProcessRegistry.adopt_local`` clears ``_hermes_owned_pgid``)."""
+        (``ProcessRegistry.adopt_local`` clears ``_hermes_owned_pgid``). A foreground scope whose wrapper died
+        before the command started (the bus vanished after the probe) is run once unscoped; a command that
+        started is never re-run. A scoped result is marked so ``_update_cwd`` can add the limit note."""
         try:
-            return super()._wait_for_process(proc, *args, **kwargs)
+            result = super()._wait_for_process(proc, *args, **kwargs)
+            retry = getattr(proc, "_hermes_scope_retry", None)
+            if retry is None:
+                return result
+            cmd_string, login, timeout, stdin_data, spawn_env = retry
+            if foreground_scope.scope_never_started(result.get("returncode"), result.get("output", ""), self._cwd_marker):
+                foreground_scope.warn_bus_lost(spawn_env)
+                fallback = self._run_bash(cmd_string, login=login, timeout=timeout, stdin_data=stdin_data)
+                if "output" in kwargs:
+                    kwargs["output"] = _new_output_collector(fallback, kwargs.get("bounded_capture", False))
+                return self._wait_for_process(fallback, *args, **kwargs)
+            result["hermes_fg_scope"] = proc._hermes_scope_unit
+            return result
         finally:
             if (owned_pgid := getattr(proc, "_hermes_owned_pgid", None)) is not None:
                 proc._hermes_owned_pgid = None
@@ -1290,12 +1312,22 @@ class LocalEnvironment(BaseEnvironment):
         return proc
 
     def _kill_process(self, proc):
-        """Kill the entire process group (all children)."""
+        """Kill the entire process group (all children), then the whole scope: it also reaps what escaped the
+        group (``setsid``) inside a foreground scope."""
         try:
             (_kill_process_windows if _IS_WINDOWS else _kill_process_group_posix)(proc)
         except OSError:  # ProcessLookupError / PermissionError included
             with contextlib.suppress(Exception):
                 proc.kill()
+        if unit := getattr(proc, "_hermes_scope_unit", None):
+            foreground_scope.stop_scope(unit)
+
+    def _update_cwd(self, result: dict):
+        """Base cwd extraction, then one line for the agent when a scoped command failed on the task limit."""
+        super()._update_cwd(result)
+        if result.pop("hermes_fg_scope", None) and (note := foreground_scope.limit_note(
+                result.get("returncode"), result.get("output", ""))):
+            result["output"] = f"{result['output']}\n{note}"
 
     def _force_kill_process(self, proc):
         """SIGKILL the whole group with no TERM grace or wait: the caller os._exit()s next."""

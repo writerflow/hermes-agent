@@ -277,6 +277,8 @@ def yield_to_background_handler(
             proc, command=command, cwd=cwd, task_id=effective_task_id,
             owner_task_id=task_id or effective_task_id, session_key=session_key,
             output_so_far=output_so_far)
+        # The command's own foreground scope goes with it, so a later kill reaps the whole scope.
+        session.systemd_unit = getattr(proc, "_hermes_scope_unit", "")
         _stamp_routing_if_gateway(process_registry, session, session_key)
         logger.info("foreground command yielded to background as %s (pid %s)", session.id, session.pid)
         return {

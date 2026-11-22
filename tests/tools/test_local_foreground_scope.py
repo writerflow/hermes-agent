@@ -33,6 +33,8 @@ from tools import foreground_scope as fs
 from tools import process_registry as pr
 from tools.environments.local import LocalEnvironment
 
+pytestmark = pytest.mark.spawns_gateway_lookalike  # host shapes run real `gateway run` lookalike holders
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 GATE_NAMES = (
     "foreground_scope_host",
@@ -166,15 +168,47 @@ def _clear_supervised_env(monkeypatch) -> None:
         monkeypatch.delenv(key, raising=False)
 
 
+_GATEWAY_PROLOGUE = '''
+import json, os, sys, time
+sys.path.insert(0, {root!r})
+from gateway import status
+if not status.acquire_gateway_runtime_lock():
+    sys.exit("could not acquire gateway.lock")
+status.write_pid_file()
+from tools import process_registry as pr
+pr._SYSTEMD_SCOPE_AVAILABLE = True
+pr._SYSTEMD_SCOPE_PROBED_AT = time.monotonic()
+'''
+
+
+def _gateway_script(tmp_path: Path, body: str) -> Path:
+    """A script that IS a live gateway to the real identity code: it runs as ``<script> gateway run`` and holds
+    the real runtime lock and gateway.pid, as the existing strict-identity tests do."""
+    script = tmp_path / "gwbin" / "hermes"
+    script.parent.mkdir(exist_ok=True)
+    script.write_text(_GATEWAY_PROLOGUE.format(root=str(REPO_ROOT)) + textwrap.dedent(body))
+    return script
+
+
+def _gateway_env() -> dict[str, str]:
+    return {**os.environ, **_SUPERVISED_ENV}
+
+
+def run_as_gateway(tmp_path: Path, body: str) -> dict:
+    """Run ``body`` inside a live-gateway-shaped process; its last stdout line is a JSON result."""
+    done = subprocess.run([sys.executable, str(_gateway_script(tmp_path, body)), "gateway", "run"],
+                          env=_gateway_env(), capture_output=True, text=True, timeout=180, check=False)
+    assert done.returncode == 0, done.stderr
+    return json.loads(done.stdout.strip().splitlines()[-1])
+
+
 @pytest.fixture()
-def foreign_gateway(monkeypatch):
-    """A live gateway in ANOTHER process, using the real lock and gateway.pid writers (the worker's view)."""
-    code = ("import sys\nfrom gateway import status as s\n"
-            "assert s.acquire_gateway_runtime_lock()\ns.write_pid_file()\n"
-            "print('ready', flush=True)\nsys.stdin.read()\n")
-    proc = subprocess.Popen(
-        [sys.executable, "-c", code], cwd=REPO_ROOT, env=os.environ.copy(), text=True,
-        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+def foreign_gateway(tmp_path):
+    """A live gateway in ANOTHER process (the worker's view of it), through the real lock and pid writers."""
+    body = "print('ready', flush=True)\nsys.stdin.read()\n"
+    proc = subprocess.Popen([sys.executable, str(_gateway_script(tmp_path, body)), "gateway", "run"],
+                            env=_gateway_env(), text=True,
+                            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     try:
         assert proc.stdout.readline().strip() == "ready", proc.stderr.read()
         yield proc
@@ -192,21 +226,6 @@ def worker_host(monkeypatch, foreign_gateway):
 
 
 @pytest.fixture()
-def gateway_host(monkeypatch):
-    """The live supervised gateway itself: this pid holds the real runtime lock and gateway.pid."""
-    from gateway import status
-    _set_supervised_env(monkeypatch)
-    monkeypatch.setattr("agent.runtime_session_store._worker_process", False)
-    assert status.acquire_gateway_runtime_lock()
-    status.write_pid_file()
-    try:
-        yield
-    finally:
-        status.release_gateway_runtime_lock()
-        status._get_pid_path().unlink(missing_ok=True)
-
-
-@pytest.fixture()
 def cli_host(monkeypatch):
     _clear_supervised_env(monkeypatch)
     monkeypatch.setattr("agent.runtime_session_store._worker_process", False)
@@ -217,6 +236,11 @@ def descendant_cli_host(monkeypatch, foreign_gateway):
     """A ``hermes`` CLI started inside a build: it inherited the worker's env but never adopted."""
     _set_supervised_env(monkeypatch)
     monkeypatch.setattr("agent.runtime_session_store._worker_process", False)
+
+
+def _systemctl(*args: str) -> subprocess.CompletedProcess:
+    return subprocess.run(["systemctl", "--user", *args], capture_output=True, text=True, timeout=60,
+                          env=pr.systemd_user_bus_env())
 
 
 @pytest.fixture()
@@ -263,8 +287,12 @@ class TestGate:
     def test_worker_shape_passes_gate(self, worker_host):
         assert fs.foreground_scope_host() is True
 
-    def test_gateway_shape_passes_gate(self, gateway_host):
-        assert fs.foreground_scope_host() is True
+    def test_gateway_shape_passes_gate(self, tmp_path):
+        out = run_as_gateway(tmp_path, """
+            import tools.foreground_scope as fs
+            print(json.dumps({"host": fs.foreground_scope_host(), "r0": pr._is_supervised_gateway_process()}))
+        """)
+        assert out == {"host": True, "r0": True}
 
     def test_cli_shapes_fail_gate(self, cli_host, monkeypatch, foreign_gateway):
         assert fs.foreground_scope_host() is False
@@ -324,20 +352,26 @@ class TestScopedCommand:
         assert result["returncode"] == 0, result
         assert "hi" in result["output"]
         (call,) = stub.calls()
-        assert call.argv[0].endswith("systemd-run")
-        assert call.argv[1:4] == ["--user", "--scope", "--quiet"]
+        assert call.argv[:3] == ["--user", "--scope", "--quiet"]  # recorded argv excludes the binary itself
         assert call.unit.startswith("hermes-worker-fg-")
         assert "--collect" in call.argv
         assert call.properties == ["MemoryAccounting=yes"]
-        assert call.command[1] == "-c", call.command  # <bash> -c <wrapped>
+        assert call.command[-2] == "-c", call.command  # <bash> [-l] -c <wrapped>
 
     def test_worker_command_is_scoped(self, worker_host, fg_config, stub, make_env):
         fg_config()
         self._assert_scoped(stub, make_env().execute("echo hi", resource_scope=True))
 
-    def test_gateway_command_is_scoped(self, gateway_host, fg_config, stub, make_env):
+    def test_gateway_command_is_scoped(self, fg_config, stub, tmp_path):
         fg_config()
-        self._assert_scoped(stub, make_env().execute("echo hi", resource_scope=True))
+        result = run_as_gateway(tmp_path, f"""
+            from tools.environments.local import LocalEnvironment
+            LocalEnvironment.init_session = lambda self, *a, **k: None
+            env = LocalEnvironment(cwd={str(tmp_path)!r}, timeout=60)
+            r = env.execute("echo hi", resource_scope=True)
+            print(json.dumps({{"returncode": r["returncode"], "output": r["output"]}}))
+        """)
+        self._assert_scoped(stub, result)
 
     def test_cli_commands_are_not_scoped(self, cli_host, fg_config, stub, make_env, monkeypatch, foreign_gateway):
         fg_config()
@@ -454,8 +488,8 @@ class TestPropertySet:
         real_systemd_stub.set_extra_properties(*D6_PROPERTIES)
         env = make_env()
         out = env.execute(
-            "sleep 20 & sleep 1; systemctl --user show \"$(basename $(cut -d: -f3 /proc/self/cgroup))\" "
-            "-p MemoryHigh -p MemorySwapMax -p MemoryMax -p TasksMax -p CPUQuotaPerSecUSec -p CPUWeight; kill %1",
+            "systemctl --user show \"$(basename $(cut -d: -f3 /proc/self/cgroup))\" "
+            "-p MemoryHigh -p MemorySwapMax -p MemoryMax -p TasksMax -p CPUQuotaPerSecUSec -p CPUWeight",
             resource_scope=True)["output"]
         shown = dict(line.split("=", 1) for line in out.splitlines() if "=" in line)
         assert shown["MemoryHigh"] == str(5 * 1024 ** 3), out
@@ -493,16 +527,18 @@ class TestScopeLifecycle:
                             lambda unit: stopped.append(unit) or (real(unit) if result is None else result))
         return stopped
 
+    @pytest.mark.live_system_guard_bypass  # stops its own hermes-worker-fg scope, named at run time
     def test_timeout_stops_the_whole_scope(self, worker_host, fg_config, real_systemd_stub, make_env, monkeypatch):
         fg_config()
         stopped = self._spy_stop(monkeypatch, result=None)
         result = make_env().execute("sleep 30 & setsid sleep 30 & wait", resource_scope=True, timeout=1)
         assert result["returncode"] == 124, result
         (call,) = real_systemd_stub.calls()
-        assert stopped == [call.unit]
-        state = subprocess.run(["systemctl", "--user", "is-active", call.unit], capture_output=True, text=True)
+        assert stopped == [f"{call.unit}.scope"]
+        state = _systemctl("is-active", f"{call.unit}.scope")
         assert state.stdout.strip() == "inactive", state
 
+    @pytest.mark.live_system_guard_bypass  # stops its own hermes-worker-fg scope, named at run time
     def test_normal_exit_leaves_the_scope_to_systemd(self, worker_host, fg_config, real_systemd_stub, make_env,
                                                      monkeypatch):
         fg_config()
@@ -512,10 +548,10 @@ class TestScopeLifecycle:
         try:
             assert result["returncode"] == 0 and "started" in result["output"], result
             assert stopped == []
-            state = subprocess.run(["systemctl", "--user", "is-active", call.unit], capture_output=True, text=True)
+            state = _systemctl("is-active", f"{call.unit}.scope")
             assert state.stdout.strip() == "active", state
         finally:
-            subprocess.run(["systemctl", "--user", "stop", call.unit], capture_output=True, timeout=30)
+            _systemctl("stop", f"{call.unit}.scope")
 
     def test_yield_to_background_carries_the_scope_unit(self, worker_host, fg_config, stub, make_env, monkeypatch):
         from tools.terminal_tool_background import yield_to_background_handler
@@ -529,9 +565,9 @@ class TestScopeLifecycle:
             handed = handler(proc, "")
             session = pr.process_registry.get(handed["yielded_session_id"])
             (call,) = stub.calls()
-            assert session.systemd_unit == call.unit
+            assert session.systemd_unit == f"{call.unit}.scope"
             pr.process_registry.kill_process(session.id)
-            assert stopped == [call.unit]
+            assert stopped == [f"{call.unit}.scope"]
         finally:
             proc.kill()
 
