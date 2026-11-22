@@ -501,3 +501,227 @@ async def test_site_detached_mounted_a_draining_store_still_leaves_the_event_unc
     before = _bound()
     assert await follow_detached_pin(runner, evt) == evt
     assert _bound() == before, "the scope leaked past the mount"
+
+
+# --- Off-loop rows: regression assertions (no product change expected) --------------------------------
+
+def _session_authority(home, **extra):
+    live = SimpleNamespace(source=None, subscribers=[])
+    return _authority(
+        home, sessions={"sid": live}, agent=lambda ref: None,
+        authorize=lambda actor, ref, capability: None, **extra)
+
+
+def _conn(authority):
+    return SimpleNamespace(authority=authority, actor=SimpleNamespace(capabilities={"session:read"}, transport_id="t"))
+
+
+@pytest.mark.asyncio
+async def test_site_session_ancillary_show_tools_reads_off_the_loop(tmp_path, reads, n0, monkeypatch):
+    import model_tools
+    from gateway import session_ancillary, session_policy
+    from gateway.session_contract import SessionRef
+    home = _make_home(tmp_path, "show-tools")
+    authority = _session_authority(home)
+    monkeypatch.setattr(session_policy, "policy_for_source", lambda runner, source: None)
+    monkeypatch.setattr(model_tools, "get_tool_definitions", lambda **kw: [])
+    await session_ancillary.show_tools(_conn(authority), SessionRef(str(home), "sid"), {"session_id": "sid"})
+    _assert_reach(reads, home, n0)
+    _assert_off_loop(reads, home, threading.get_ident())
+
+
+@pytest.mark.asyncio
+async def test_site_session_ancillary_reload_skills_reads_off_the_loop(tmp_path, reads, n0, monkeypatch):
+    from agent import skill_commands
+    from gateway import session_ancillary, session_policy
+    from gateway.session_contract import SessionRef
+    home = _make_home(tmp_path, "reload-skills")
+    authority = _session_authority(home)
+    monkeypatch.setattr(session_policy, "policy_for_source", lambda runner, source: None)
+    monkeypatch.setattr(session_policy, "policy_scope", lambda policy, authority=None: __import__("contextlib").nullcontext())
+    monkeypatch.setattr(skill_commands, "reload_skills", lambda: {"added": [], "removed": [], "total": 0})
+    await session_ancillary.reload_skills(_conn(authority), SessionRef(str(home), "sid"), {"session_id": "sid"})
+    _assert_reach(reads, home, n0)
+    _assert_off_loop(reads, home, threading.get_ident())
+
+
+@pytest.mark.asyncio
+async def test_site_session_tui_reads_run_tui_read_reads_off_the_loop(tmp_path, reads, n0, monkeypatch):
+    from contextlib import nullcontext
+    from gateway import session_commands, session_tui_reads
+    from gateway.session_contract import SessionRef
+    home = _make_home(tmp_path, "tui-read")
+    authority = _session_authority(home)
+    monkeypatch.setattr(session_commands, "_session_workspace", lambda runner, source: nullcontext())
+    out = await session_tui_reads.run_tui_read(authority, SessionRef(str(home), "sid"), authority.sessions["sid"],
+                                               None, lambda *a: "rendered", "")
+    assert out["output"] == "rendered"
+    _assert_reach(reads, home, n0)
+    _assert_off_loop(reads, home, threading.get_ident())
+
+
+@pytest.mark.asyncio
+async def test_site_session_transcript_subagent_reads_off_the_loop(tmp_path, reads, n0, monkeypatch):
+    from gateway import session_transcript_subagent
+    from gateway.session_contract import SessionRef
+    home = _make_home(tmp_path, "transcript")
+    authority = _session_authority(home)
+    monkeypatch.setattr(session_transcript_subagent, "_child", lambda *a: (None, False))
+    result = await session_transcript_subagent.subagent_transcript(
+        _conn(authority), SessionRef(str(home), "sid"), {"session_id": "sid"}, ("sid", "sub"), None, 10, False)
+    assert result["available"] is False
+    _assert_reach(reads, home, n0)
+    _assert_off_loop(reads, home, threading.get_ident())
+
+
+@pytest.mark.asyncio
+async def test_site_session_llm_oneshot_work_runs_on_the_owners_pool_not_the_loop(tmp_path, reads, n0, monkeypatch):
+    """Through the real ``DeferredReply.start`` and the owner's pool: no test-created executor."""
+    from agent import oneshot as oneshot_module
+    from gateway import session_llm_oneshot
+    from gateway.session_contract import SessionRef
+    home = _make_home(tmp_path, "oneshot")
+    authority = _authority(home)
+    connection = SimpleNamespace(authority=authority, transport=SimpleNamespace(),
+                                 actor=SimpleNamespace(capabilities={"session:read"}, transport_id="t"))
+    monkeypatch.setattr(oneshot_module, "run_oneshot", lambda **kw: "title")
+    monkeypatch.setattr("gateway.session_authorities.require_serving", lambda a: None)
+    reply = await session_llm_oneshot.oneshot(connection, SessionRef(str(home), ""), {"input": "x"})
+    reply.start(connection, 1)  # the production scheduling path
+    for _ in range(1000):
+        if len(reads.reads_for(home)) >= n0:
+            break
+        await asyncio.sleep(0.01)
+    _assert_reach(reads, home, n0)
+    _assert_off_loop(reads, home, threading.get_ident())
+    assert reads.reads_for(home)[0][1] != threading.current_thread().name
+
+
+@pytest.mark.asyncio
+async def test_site_session_usage_account_usage_reads_off_the_loop(tmp_path, reads, n0, monkeypatch):
+    from agent import account_usage as account_usage_module, account_usage_nous, billing_usage
+    from gateway import session_llm_oneshot, session_usage
+    from gateway.session_contract import SessionRef
+    home = _make_home(tmp_path, "usage")
+
+    async def resolve(actor, ref):
+        return None
+
+    authority = _session_authority(home, resolve=resolve)
+    monkeypatch.setattr(session_llm_oneshot, "_session_runtime", lambda auth, ref: (lambda: {}))
+    monkeypatch.setattr(account_usage_module, "account_limit_lines", lambda *a, **k: [])
+    monkeypatch.setattr(account_usage_nous, "nous_usage_view", lambda **k: ([], None))
+    monkeypatch.setattr(billing_usage, "usage_model_wire", lambda usage: None)
+    await session_usage.account_usage(_conn(authority), SessionRef(str(home), "sid"), {"session_id": "sid"})
+    _assert_reach(reads, home, n0)
+    _assert_off_loop(reads, home, threading.get_ident())
+
+
+@pytest.mark.asyncio
+async def test_site_session_tui_reads_context_breakdown_reads_off_the_loop(tmp_path, reads, n0, monkeypatch):
+    from contextlib import nullcontext
+    from agent import context_breakdown, context_file_sources
+    from gateway import session_commands, session_tui_reads
+    from gateway.session_contract import SessionRef
+    home = _make_home(tmp_path, "breakdown")
+    agent = SimpleNamespace()
+    authority = _session_authority(home, db=SimpleNamespace(conversation_revision=lambda tip: 1))
+    authority.agent = lambda ref: agent
+    authority.sessions["sid"].context_breakdown = None
+    monkeypatch.setattr(session_commands, "_session_workspace", lambda runner, source: nullcontext())
+    monkeypatch.setattr(session_tui_reads, "_context_id", lambda auth, ref: "tip")
+    monkeypatch.setattr(session_tui_reads, "_agent_context_marks", lambda a: ())
+    monkeypatch.setattr(session_tui_reads, "_model_history", lambda db, tip: [])
+    monkeypatch.setattr(context_breakdown, "compute_session_context_breakdown", lambda a, c: {"categories": []})
+    monkeypatch.setattr(context_file_sources, "context_file_sources_for_agent", lambda a: [])
+    await session_tui_reads.context_breakdown(_conn(authority), SessionRef(str(home), "sid"), {"session_id": "sid"})
+    _assert_reach(reads, home, n0)
+    _assert_off_loop(reads, home, threading.get_ident())
+
+
+@pytest.mark.asyncio
+async def test_site_session_hosted_transport_admission_check_runs_through_the_claim_hop(tmp_path, reads, n0, monkeypatch):
+    """The real ``SessionAuthority._claim_next``: the admission check's ``owner_scope`` must land in the
+    ``to_thread`` hop the claim makes, not on the loop. The test never calls ``to_thread`` itself."""
+    import sqlite3
+    from contextlib import closing, contextmanager
+    from gateway import (session_authority, session_deferred_pick, session_local_recovery,
+                         session_setting_commands)
+    from gateway.config import Platform
+    from gateway.session_contract import SessionRef
+    from hermes_state_runtime import RuntimeStoreError
+    home = _make_home(tmp_path, "admission")
+    row = {"status": "queued", "request_id": "hosted:r1", "admission_id": "a1", "payload": {}}
+
+    @contextmanager
+    def read_ctx():
+        with closing(sqlite3.connect(":memory:")) as conn:
+            conn.execute("CREATE TABLE state_meta (key TEXT, value TEXT)")
+            yield conn
+
+    async def no_op(*a, **k):
+        return None
+
+    authority = _authority(home, db=SimpleNamespace(_read_ctx=read_ctx))
+    live = SimpleNamespace(source=SimpleNamespace(platform=Platform.LOCAL), claim_gate=asyncio.Lock(),
+                           mutation_lock=asyncio.Lock())
+    monkeypatch.setattr(session_authority, "list_session_admissions", lambda db, session_id=None: [row])
+    monkeypatch.setattr(session_setting_commands, "apply_pending_reasoning", no_op)
+    monkeypatch.setattr(session_deferred_pick, "apply_deferred_pick", no_op)
+    monkeypatch.setattr(session_local_recovery, "restore_local_session", lambda *a: None)
+    with pytest.raises(RuntimeStoreError) as raised:
+        await session_authority.SessionAuthority._claim_next(authority, SessionRef(str(home), "sid"), live)
+    assert raised.value.reason == "permission_denied"
+    _assert_reach(reads, home, n0)
+    _assert_off_loop(reads, home, threading.get_ident())
+
+
+async def _hosted_dispatch(tmp_path, verb, params_extra, attest):
+    """Install the real hosted transport and send ``verb`` through the real dispatcher's executors."""
+    import json
+    from gateway.control_dispatch import ControlRequestDispatcher
+    from gateway.session_hosted_transport import install_hosted_transport
+    home = _make_home(tmp_path, "hosted-" + verb)
+    authority = _authority(home, epoch=1, db=SimpleNamespace())
+    server = SimpleNamespace(private_handlers={})
+    install_hosted_transport(server, authority, asyncio.get_running_loop(), attest=attest)
+    handler_fn = server.private_handlers[verb]
+
+    def handler(raw, peer):
+        return json.dumps(handler_fn(json.loads(raw)["params"], peer)).encode()
+
+    dispatcher = ControlRequestDispatcher()
+    request = json.dumps({"verb": verb, "params": {"profile_id": str(home), **params_extra}}).encode()
+    try:
+        return home, await dispatcher.dispatch(handler, request, "peer")
+    finally:
+        dispatcher.close()
+
+
+@pytest.mark.asyncio
+async def test_site_session_hosted_transport_source_handler_runs_on_a_control_worker(tmp_path, reads, n0):
+    seen = []
+
+    def attest(selector, operation, params):
+        seen.append(threading.current_thread().name)
+        return {"owner": "o"}
+
+    home, out = await _hosted_dispatch(tmp_path, "hosted-attest", {
+        "selector": {"room_id": "r", "member_id": "m", "profile": "p"}, "operation": "submit", "params": {}}, attest)
+    assert seen and seen[0].startswith("gateway-control")
+    _assert_reach(reads, home, n0)
+    _assert_off_loop(reads, home, threading.get_ident())
+
+
+@pytest.mark.asyncio
+async def test_site_session_hosted_transport_target_handler_runs_on_a_producer_worker(tmp_path, reads, n0):
+    from hermes_state_runtime import RuntimeStoreError
+    with pytest.raises(RuntimeStoreError) as raised:  # a malformed envelope: refused right after the scope is entered
+        await _hosted_dispatch(tmp_path, "hosted-producer", {"bogus": 1}, lambda *a: {"owner": "o"})
+    assert raised.value.reason == "invalid_params"
+    homes = {r[2].parent for r in reads.reads}
+    assert len(homes) == 1
+    home = next(iter(homes))
+    _assert_reach(reads, home, n0)
+    _assert_off_loop(reads, home, threading.get_ident())
+    assert reads.reads_for(home)[0][1].startswith("gateway-hosted-producer")
