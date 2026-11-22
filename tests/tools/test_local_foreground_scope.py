@@ -82,13 +82,12 @@ class SystemdStub:
         self.extra = root / "extra_properties"
         body = self.SCRIPTS[mode]
         if real is not None:  # inject extra --property values, then hand over to the real systemd-run
-            body = textwrap.dedent(f"""
-                pre=("${{args[@]:0:$sep}}")
-                if [ -f '{self.extra}' ]; then
-                  while IFS= read -r p; do pre+=(--property "$p"); done < '{self.extra}'
-                fi
-                exec '{real}' "${{pre[@]}}" -- "${{args[@]:$((sep+1))}}"
-            """)
+            body = (
+                f'pre=("${{args[@]:0:$sep}}"); '
+                f"if [ -f '{self.extra}' ]; then "
+                f"while IFS= read -r p; do pre+=(--property \"$p\"); done < '{self.extra}'; fi; "
+                f"exec '{real}' \"${{pre[@]}}\" -- \"${{args[@]:$((sep+1))}}\""
+            )
         script = textwrap.dedent(f"""\
             #!/bin/bash
             printf '%s\\0' "$@" > '{self.records}'/$$.argv

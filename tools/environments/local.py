@@ -1114,6 +1114,7 @@ class LocalEnvironment(BaseEnvironment):
     is_local = True
     # A subclass that confines its commands (a sandbox) sets this False: see BaseEnvironment.
     uses_host_filesystem = True
+    supports_resource_scope = True
 
     def _additional_profile_scoped_passthrough_names(self) -> tuple[str, ...]:
         """First-party ``BUZZ_*`` names present in the env, excluded from the shared
@@ -1222,7 +1223,7 @@ class LocalEnvironment(BaseEnvironment):
         self.cwd = safe_cwd
 
     def _run_bash(self, cmd_string: str, *, login: bool = False, timeout: int = 120,
-                  stdin_data: str | None = None) -> subprocess.Popen:
+                  stdin_data: str | None = None, resource_scope: bool = False) -> subprocess.Popen:
         bash = _find_bash()
         run_env = _make_run_env(self.env)
         # Login invocations (init_session's env snapshot) source the user's rc /
