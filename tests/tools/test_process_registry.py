@@ -2627,7 +2627,9 @@ class TestSystemdCgroupIsolation:
         def systemd_run_without_placement(argv, **kwargs):
             payload = argv[argv.index("--") + 1 :]
             executed.append(payload)
-            result = real_run(payload, **kwargs)
+            # The PM dependency interpreter need not have checkout modules on
+            # sys.path before Hermes bootstrap. The inert check uses stdlib only.
+            result = real_run([payload[0], "-S", *payload[1:]], **kwargs)
             assert result.returncode == 1 and not result.stderr, result
             return result
 

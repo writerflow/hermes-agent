@@ -99,7 +99,7 @@ class ScopeBus:
 
 
 def probe_payload(name: str) -> list[str]:
-    return [sys.executable, "-I", "-m", "tools.work_scope", name]
+    return [sys.executable, "-I", str(Path(__file__).resolve()), name]
 
 
 def _verify_inert_probe(name: str) -> int:
