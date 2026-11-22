@@ -243,7 +243,7 @@ def _publish_world(tmp_path, monkeypatch, names=("alpha", "beta")):
 
     def recover(adapter, authority):
         order.append("recover")
-        recovered.append((authority, threading.get_ident(), _bound()["home"]))
+        recovered.append((authority, threading.get_ident(), _bound()))
 
     monkeypatch.setattr(session_api_turn, "recover_authority_api_turns", recover)
     monkeypatch.setattr(run_adapters, "hand_over_held_inbound", lambda *a: handed.append(a))
@@ -269,7 +269,7 @@ async def test_site_api_recover_reconnect_reads_each_profile_off_the_loop(tmp_pa
         _assert_off_loop(reads, home, loop_ident)
     assert runner.adapters[Platform.API_SERVER] is adapter
     assert [(ident == loop_ident) for _a, ident, _h in recovered] == [True, True]
-    assert [h for _a, _i, h in recovered] == [str(home) for home in homes]
+    assert [b["home"] for _a, _i, b in recovered] == [str(home) for home in homes]
 
 
 @pytest.mark.asyncio
@@ -284,3 +284,166 @@ async def test_site_api_recover_startup_reads_each_profile_off_the_loop(tmp_path
         _assert_reach(reads, home, n0)
         _assert_off_loop(reads, home, loop_ident)
     assert [(ident == loop_ident) for _a, ident, _h in recovered] == [True, True]
+
+
+# --- Publication protocol: the profile read is the only await, and it precedes installation ----------
+
+class _Gate:
+    """Holds ``prepare_owner_scope`` open at its suspension and releases it on demand."""
+
+    def __init__(self, monkeypatch, fail_for=()):
+        from gateway import session_authorities
+        self.started, self.release = asyncio.Event(), asyncio.Event()
+        real = session_authorities.prepare_owner_scope
+        self.fail_for = tuple(fail_for)
+
+        async def gated(authority):
+            if authority.profile_id in self.fail_for:
+                raise OSError("profile unreadable")
+            self.started.set()
+            await self.release.wait()
+            return await real(authority)
+
+        monkeypatch.setattr(session_authorities, "prepare_owner_scope", gated)
+
+    async def blocked(self):
+        try:
+            await asyncio.wait_for(self.started.wait(), timeout=2)
+        except asyncio.TimeoutError:
+            pytest.fail("adapter publication never suspended in prepare_owner_scope: "
+                        "the profile read is not a separate step before installation")
+
+
+@pytest.mark.asyncio
+async def test_publish_never_partial_reconnect(tmp_path, reads, n0, monkeypatch):
+    from gateway.config import Platform
+    runner, adapter, homes, _auth, order, recovered, _handed = _publish_world(tmp_path, monkeypatch)
+    gate = _Gate(monkeypatch)
+    task = asyncio.create_task(runner._install_reconnected_adapter(Platform.API_SERVER, adapter))
+    await gate.blocked()
+    assert runner.adapters.get(Platform.API_SERVER) is not adapter
+    assert Platform.API_SERVER in runner._failed_platforms
+    assert order == []
+    gate.release.set()
+    await task
+    assert runner.adapters[Platform.API_SERVER] is adapter
+    assert order == ["recover", "recover", "voice_sync", "voice_bind"]
+    assert all(ident == threading.get_ident() for _a, ident, _b in recovered)
+
+
+@pytest.mark.asyncio
+async def test_publish_never_partial_startup(tmp_path, reads, n0, monkeypatch):
+    from gateway.config import Platform
+    runner, adapter, homes, _auth, order, recovered, _handed = _publish_world(tmp_path, monkeypatch)
+    gate = _Gate(monkeypatch)
+    task = asyncio.create_task(runner._start_aggregate_connect_results(
+        [(Platform.API_SERVER, adapter, object(), "ok", None)], [], []))
+    await gate.blocked()
+    assert runner.adapters.get(Platform.API_SERVER) is not adapter
+    assert order == []
+    gate.release.set()
+    assert await task == 1
+    assert runner.adapters[Platform.API_SERVER] is adapter
+    assert order == ["recover", "recover", "voice_sync", "voice_bind"]
+
+
+@pytest.mark.asyncio
+async def test_cancel_during_prepare_reconnect_disposes_the_unpublished_adapter(tmp_path, reads, n0, monkeypatch):
+    from gateway.config import Platform
+    runner, adapter, homes, _auth, order, recovered, handed = _publish_world(tmp_path, monkeypatch)
+    gate = _Gate(monkeypatch)
+    task = asyncio.create_task(runner._install_reconnected_adapter(Platform.API_SERVER, adapter))
+    await gate.blocked()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert runner.adapters.get(Platform.API_SERVER) is not adapter
+    assert adapter.disconnects == 1
+    assert handed == [(adapter, None)]
+    assert Platform.API_SERVER in runner._failed_platforms
+    assert order == []
+
+
+@pytest.mark.asyncio
+async def test_cancel_during_prepare_startup_disconnects_the_unpublished_adapter(tmp_path, reads, n0, monkeypatch):
+    from gateway.config import Platform
+    runner, adapter, homes, _auth, order, recovered, _handed = _publish_world(tmp_path, monkeypatch)
+    gate = _Gate(monkeypatch)
+    task = asyncio.create_task(runner._start_aggregate_connect_results(
+        [(Platform.API_SERVER, adapter, object(), "ok", None)], [], []))
+    await gate.blocked()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert runner.adapters.get(Platform.API_SERVER) is not adapter
+    assert runner.safe_disconnects == [adapter] and adapter.disconnects == 1
+    assert runner.status_updates == [] and order == []
+
+
+@pytest.mark.asyncio
+async def test_prepare_failure_degrades_one_authority(tmp_path, reads, n0, monkeypatch, caplog):
+    import logging
+    from gateway.config import Platform
+    runner, adapter, homes, authorities, order, recovered, _handed = _publish_world(tmp_path, monkeypatch)
+    gate = _Gate(monkeypatch, fail_for=[str(homes[1])])
+    gate.release.set()
+    with caplog.at_level(logging.WARNING):
+        await runner._install_reconnected_adapter(Platform.API_SERVER, adapter)
+    assert runner.adapters[Platform.API_SERVER] is adapter and order[-2:] == ["voice_sync", "voice_bind"]
+    assert [b["home"] for _a, _i, b in recovered] == [str(h) for h in homes]
+    assert any(homes[1].name in rec.getMessage() for rec in caplog.records if rec.levelno >= logging.WARNING)
+    # alpha was prepared in a worker; beta fell back to the sync scope (on the loop, accepted and logged)
+    assert reads.on_loop(homes[0], threading.get_ident()) == []
+    assert len(reads.reads_for(homes[1])) == n0
+
+
+@pytest.mark.asyncio
+async def test_authority_added_or_retired_during_prepare(tmp_path, reads, n0, monkeypatch, caplog):
+    import logging
+    from gateway.config import Platform
+    runner, adapter, homes, authorities, order, recovered, _handed = _publish_world(tmp_path, monkeypatch)
+    live = list(authorities)
+    runner.session_authorities = SimpleNamespace(serving=lambda: list(live))
+    gate = _Gate(monkeypatch)
+    task = asyncio.create_task(runner._install_reconnected_adapter(Platform.API_SERVER, adapter))
+    await gate.blocked()
+    added = _authority(_make_home(tmp_path, "gamma"))
+    live.append(added)
+    live.remove(authorities[0])  # retiring: no longer served
+    with caplog.at_level(logging.WARNING):
+        gate.release.set()
+        await task
+    got = [b["home"] for _a, _i, b in recovered]
+    assert got == [str(homes[1]), added.profile_id]
+    assert any("gamma" in rec.getMessage() for rec in caplog.records if rec.levelno >= logging.WARNING)
+
+
+def test_publish_is_synchronous_between_install_and_voice_wiring(tmp_path, monkeypatch):
+    """A caller that does not await sees the adapter installed, recovered and wired at once."""
+    from gateway.config import Platform
+    runner, adapter, homes, _auth, order, recovered, _handed = _publish_world(tmp_path, monkeypatch)
+    runner._publish_primary_adapter(Platform.API_SERVER, adapter)
+    assert runner.adapters[Platform.API_SERVER] is adapter
+    assert order == ["recover", "recover", "voice_sync", "voice_bind"]
+
+
+@pytest.mark.asyncio
+async def test_unrouted_owner_binds_its_prepared_scope_without_reading_or_warning(tmp_path, reads, n0, monkeypatch, caplog):
+    """A symbolic-id owner has no profile files: its prepared entry is ``None`` and recovery binds exactly
+    what the sync ``owner_scope`` binds, with no fallback warning (it is not a failed preparation)."""
+    import logging
+    from gateway import session_api_turn
+    from gateway.session_authorities import owner_scope
+    runner, adapter, homes, authorities, order, recovered, _handed = _publish_world(tmp_path, monkeypatch)
+    unrouted = SimpleNamespace(profile_id="fixture", runner=SimpleNamespace(config=SimpleNamespace(multiplex_profiles=False)))
+    runner.session_authorities = SimpleNamespace(serving=lambda: [unrouted, authorities[0]])
+    with owner_scope(unrouted):
+        expected = _bound()
+    prepared = await session_api_turn.prepare_api_recovery(adapter)
+    assert prepared[id(unrouted)] is None
+    with caplog.at_level(logging.WARNING):
+        session_api_turn.recover_api_turns(adapter, prepared)
+    assert recovered[0][0] is unrouted and recovered[0][2] == expected
+    assert recovered[1][2]["home"] == str(homes[0])
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert reads.reads_for(Path("fixture")) == []
