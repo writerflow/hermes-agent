@@ -296,11 +296,6 @@ DEFAULT_CONFIG = {
         # after 72h) — NOT tmpfs /tmp, which is RAM-capped and fills under load. Must be an existing
         # absolute POSIX path; user-set paths are never auto-pruned.
         "temp_dir": "",
-        # Foreground terminal commands of a managed worker/gateway run in their own transient systemd scope
-        # (hermes-worker-fg-*), limited by drop-ins. Off by default; read per command, so no restart is needed.
-        # gradle_daemon: "per_command" gives each command its own single-use Gradle daemon inside the scope;
-        # "shared" leaves GRADLE_OPTS alone.
-        "foreground_scope": {"enabled": False, "gradle_daemon": "per_command"},
         # CSS font-family for the desktop app's xterm.js terminal (e.g. "'CaskaydiaCoveNerdFont',
         # monospace"). Empty = built-in default ("'JetBrains Mono', 'Cascadia Code', 'SF Mono',
         # Menlo, Consolas, monospace"). Lets users use a Nerd Font without patching the app.

@@ -79,12 +79,9 @@ def foreground_scope_host() -> bool:
 
 
 def _settings() -> _Settings:
-    """Read per command so flipping the flag needs no restart; an unreadable config means off."""
-    try:
-        section = cfg_get(read_raw_config_readonly(), "terminal", "foreground_scope", default={})
-    except Exception as exc:
-        logger.debug("foreground scope config unreadable, treating as off: %s", exc)
-        return _Settings(False, _GRADLE_PER_COMMAND)
+    """Read per command so flipping the flag needs no restart. ``read_raw_config`` returns ``{}`` for a missing
+    or unparseable file, which means off."""
+    section = cfg_get(read_raw_config_readonly(), "terminal", "foreground_scope", default={})
     if not isinstance(section, Mapping):
         return _Settings(False, _GRADLE_PER_COMMAND)
     mode = section.get("gradle_daemon", _GRADLE_PER_COMMAND)

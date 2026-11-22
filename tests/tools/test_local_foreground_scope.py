@@ -91,7 +91,7 @@ class SystemdStub:
                 f"exec '{real}' \"${{pre[@]}}\" -- \"${{args[@]:$((sep+1))}}\""
             )
         script = textwrap.dedent(f"""\
-            #!/bin/bash
+            #!/usr/bin/env bash
             printf '%s\\0' "$@" > '{self.records}'/$$.argv
             env -0 > '{self.records}'/$$.env
             args=("$@"); sep=0
@@ -239,7 +239,7 @@ def descendant_cli_host(monkeypatch, foreign_gateway):
 
 
 def _systemctl(*args: str) -> subprocess.CompletedProcess:
-    return subprocess.run(["systemctl", "--user", *args], capture_output=True, text=True, timeout=60,
+    return subprocess.run(["systemctl", "--user", *args], capture_output=True, text=True, timeout=60, check=False,
                           env=pr.systemd_user_bus_env())
 
 
@@ -478,10 +478,13 @@ class TestPropertySet:
         for limit in ("MemoryMax", "MemoryHigh", "CPUQuota", "TasksMax", "MemorySwapMax"):
             assert not any(limit in element for element in call.argv), (limit, call.argv)
 
-    def test_no_memory_max_code_path(self):
-        from hermes_cli.config import DEFAULT_CONFIG
+    def test_no_memory_max_code_path(self, worker_host, stub, fg_config, make_env):
+        """A leftover ``memory_max_mb`` key is ignored: no MemoryMax reaches the scope, however configured."""
+        fg_config(raw=_yaml({"terminal": {"foreground_scope": {"enabled": True, "memory_max_mb": 4096}}}))
+        make_env().execute("echo hi", resource_scope=True)
+        (call,) = stub.calls()
+        assert not any("MemoryMax" in element for element in call.argv), call.argv
         assert not hasattr(fs, "_foreground_memory_max_bytes")
-        assert "memory_max_mb" not in DEFAULT_CONFIG["terminal"]["foreground_scope"]
 
     def test_real_scope_property_set(self, worker_host, fg_config, real_systemd_stub, make_env):
         fg_config()
