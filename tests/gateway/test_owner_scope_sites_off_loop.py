@@ -447,3 +447,57 @@ async def test_unrouted_owner_binds_its_prepared_scope_without_reading_or_warnin
     assert recovered[1][2]["home"] == str(homes[0])
     assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
     assert reads.reads_for(Path("fixture")) == []
+
+
+# --- Row 13: detached-pin follow mounts a session that is not mounted -------------------------------
+
+def _detached_world(tmp_path, monkeypatch, *, mounted=False, restore=None):
+    from gateway import session_detached, session_route_recovery
+    home = _make_home(tmp_path, "detached")
+    live = SimpleNamespace(route="agent:main:chat")
+    authority = _authority(home, sessions={"sid": live} if mounted else {})
+    runner = SimpleNamespace(session_authority=authority,
+                             session_store=SimpleNamespace(_named_profile_for_key=lambda route: None))
+    restored = []
+
+    def restore_routed_session(auth, session_id):
+        restored.append((session_id, _bound()["home"]))
+        if restore is not None:
+            restore()
+
+    monkeypatch.setattr(session_route_recovery, "restore_routed_session", restore_routed_session)
+    key = f"agent:main:{session_detached._SLOT}:sid"
+    evt = {"session_key": key, "text": "result"}
+    return home, runner, evt, restored
+
+
+@pytest.mark.asyncio
+async def test_site_detached_mounted_reads_the_profile_off_the_loop(tmp_path, reads, n0, monkeypatch):
+    from gateway.session_detached import follow_detached_pin
+    home, runner, evt, restored = _detached_world(tmp_path, monkeypatch)
+    assert await follow_detached_pin(runner, evt) == evt
+    _assert_reach(reads, home, n0)
+    _assert_off_loop(reads, home, threading.get_ident())
+    assert restored == [("sid", str(home))]  # the mount still runs under the owner's scope
+
+
+@pytest.mark.asyncio
+async def test_site_detached_mounted_enters_no_scope_for_a_session_already_mounted(tmp_path, reads, n0, monkeypatch):
+    from gateway.session_detached import follow_detached_pin
+    home, runner, evt, restored = _detached_world(tmp_path, monkeypatch, mounted=True)
+    assert (await follow_detached_pin(runner, evt))["session_key"] == "agent:main:chat"
+    assert reads.reads_for(home) == [] and restored == []
+
+
+@pytest.mark.asyncio
+async def test_site_detached_mounted_a_draining_store_still_leaves_the_event_unchanged(tmp_path, reads, n0, monkeypatch):
+    from gateway.session_detached import follow_detached_pin
+    from hermes_state_runtime import RuntimeStoreError
+
+    def draining():
+        raise RuntimeStoreError("runtime_draining")
+
+    home, runner, evt, restored = _detached_world(tmp_path, monkeypatch, restore=draining)
+    before = _bound()
+    assert await follow_detached_pin(runner, evt) == evt
+    assert _bound() == before, "the scope leaked past the mount"
