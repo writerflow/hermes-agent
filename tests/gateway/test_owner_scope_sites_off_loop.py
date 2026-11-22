@@ -431,6 +431,24 @@ def test_publish_is_synchronous_between_install_and_voice_wiring(tmp_path, monke
 async def test_unrouted_owner_binds_its_prepared_scope_without_reading_or_warning(tmp_path, reads, n0, monkeypatch, caplog):
     """A symbolic-id owner has no profile files: its prepared entry is ``None`` and recovery binds exactly
     what the sync ``owner_scope`` binds, with no fallback warning (it is not a failed preparation)."""
+    from agent import secret_scope
+    from tui_gateway import launch_profile_policy
+    # Multiplex is off in tests, so ``owner_scope`` of an unrouted owner would bind nothing and the case
+    # could not tell a recovery that binds the launch scope from one that binds nothing. Host several
+    # profiles (as tests/tui_gateway/test_legacy_fallback_launch_explicit_profile.py does) so it binds
+    # the launch profile's real scope, while the authority's runner stays ``multiplex_profiles=False``.
+    launch = _make_home(tmp_path, "launch")
+    monkeypatch.setenv("HERMES_HOME", str(launch))
+    monkeypatch.setattr(launch_profile_policy, "_snapshot", None)
+    previous = secret_scope.is_multiplex_active()
+    launch_profile_policy.activate_multi_profile_hosting()
+    try:
+        await _unrouted_case(tmp_path, reads, monkeypatch, caplog, launch)
+    finally:
+        secret_scope.set_multiplex_active(previous)
+
+
+async def _unrouted_case(tmp_path, reads, monkeypatch, caplog, launch):
     import logging
     from gateway import session_api_turn
     from gateway.session_authorities import owner_scope
@@ -439,6 +457,8 @@ async def test_unrouted_owner_binds_its_prepared_scope_without_reading_or_warnin
     runner.session_authorities = SimpleNamespace(serving=lambda: [unrouted, authorities[0]])
     with owner_scope(unrouted):
         expected = _bound()
+    assert expected["home"] == str(launch), "owner_scope of an unrouted owner must bind the launch scope here"
+    assert expected["secrets"], "the expected binding must not be empty"
     prepared = await session_api_turn.prepare_api_recovery(adapter)
     assert prepared[id(unrouted)] is None
     with caplog.at_level(logging.WARNING):
