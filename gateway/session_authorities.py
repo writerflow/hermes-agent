@@ -12,7 +12,7 @@ scoped or not, exactly as before.
 from __future__ import annotations
 
 import asyncio
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -304,19 +304,33 @@ async def async_owner_scope(authority):
     Every RPC a client sends enters its owner's scope, and the classic CLI, Ink and Desktop poll
     ``subagent.list`` / ``process.list`` every 1-5 s per session: built on the loop, that scope was the
     largest single cost of RPC dispatch on a multiplexed gateway with many sessions open."""
+    prepared = await prepare_owner_scope(authority)
+    with bind_prepared_owner_scope(authority, prepared):
+        yield
+
+
+async def prepare_owner_scope(authority):
+    """The profile reads of ``owner_scope``, done in a worker thread: ``(secrets, terminal scope)``, or
+    ``None`` when the owner is unrouted (single-profile gateway, symbolic id) or its home is gone. A
+    ``None`` binds through the sync ``owner_scope``, which reads no profile files in those cases."""
     runner = getattr(authority, 'runner', None)
     home = Path(str(authority.profile_id))
     if not getattr(getattr(runner, 'config', None), 'multiplex_profiles', False) or not home.is_absolute():
-        with owner_scope(authority):  # the launch scope (frozen sources) or nullcontext: no profile files
-            yield
-        return
-    prepared = await asyncio.to_thread(_prepare_owner_scope, home)
+        return None
+    return await asyncio.to_thread(_prepare_owner_scope, home)
+
+
+@contextmanager
+def bind_prepared_owner_scope(authority, prepared):
+    """Bind what ``prepare_owner_scope`` returned: context variables only, no file I/O (except for an
+    unrouted owner, whose ``owner_scope`` binds the launch scope or nothing)."""
     if prepared is None:
-        yield
+        with owner_scope(authority):
+            yield
         return
     from gateway.run import _profile_runtime_scope
     secrets, terminal = prepared
-    with _profile_runtime_scope(home, secrets, prepared_terminal_scope=terminal):
+    with _profile_runtime_scope(Path(str(authority.profile_id)), secrets, prepared_terminal_scope=terminal):
         yield
 
 
