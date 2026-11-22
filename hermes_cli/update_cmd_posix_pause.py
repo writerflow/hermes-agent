@@ -40,8 +40,11 @@ import signal
 import subprocess
 import sys
 import time
+import uuid
 from contextlib import suppress
 from pathlib import Path
+
+from tools.work_scope import OOM_POLICY, ScopeBus, ScopeVerificationError
 
 #: This run's token: armed in ``_cmd_update_impl``, filled at the commit point. Same dict object
 #: the completion request carries, so the paused set reaches the completion child.
@@ -59,6 +62,8 @@ _LEFT_PENDING: dict[int, int] = {}
 
 _STOP_TIMEOUT_S = 120.0
 _READY_TIMEOUT_S = 30.0
+_ESCAPE_REFUSAL = "cannot verify systemd updater escape (including OOMPolicy=continue); update refused"
+_escape_failed = False
 
 
 class PauseRefused(RuntimeError):
@@ -275,6 +280,9 @@ def _escape_cgroup(unit: dict) -> bool:
     into a transient scope so stopping *unit* cannot kill it. True only when proven out: a
     membership that cannot be read (either side) keeps the unit running, since its stop would take
     this update down with it."""
+    global _escape_failed
+    if _escape_failed:
+        return False
     own, unit_cgroup = _pid_cgroup(), unit.get("cgroup")
     if own is None or not unit_cgroup:
         return False
@@ -289,20 +297,38 @@ def _escape_cgroup(unit: dict) -> bool:
                 break
         pids.append(pid)
         pid = _ppid(pid)
-    bus = "--user" if unit["scope"] == "user" else "--system"
-    cmd = ["busctl", bus, "call", "org.freedesktop.systemd1", "/org/freedesktop/systemd1",
-           "org.freedesktop.systemd1.Manager", "StartTransientUnit", "ssa(sv)a(sa(sv))",
-           f"hermes-update-{os.getpid()}.scope", "fail", "2", "PIDs", "au", str(len(pids)), *map(str, pids),
-           "Description", "s", f"hermes update (outside {unit['unit']} while it is paused)", "0"]
-    with suppress(OSError, subprocess.SubprocessError):
-        subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
-                   stdin=subprocess.DEVNULL, timeout=15, check=False)
-    deadline = time.monotonic() + 5.0
+    if not pids:
+        return False
+    try:
+        _create_escape_scope(unit, pids)
+    except ScopeVerificationError:
+        # Even an unreadable response can have moved us. Do not let a subsequent
+        # cgroup-only check authorize the protected transition.
+        _escape_failed = True
+        return False
+    return True
+
+
+def _create_escape_scope(unit: dict, pids: list[int]) -> None:
+    deadline = time.monotonic() + 15.0
+    bus = ScopeBus("--user" if unit["scope"] == "user" else "--system", deadline)
+    name = f"hermes-update-{os.getpid()}-{uuid.uuid4().hex}.scope"
+    job = bus.manager_call(
+        "o", "StartTransientUnit", "ssa(sv)a(sa(sv))", name, "fail", "3",
+        "PIDs", "au", str(len(pids)), *map(str, pids),
+        "Description", "s", f"hermes update (outside {unit['unit']} while it is paused)",
+        "OOMPolicy", "s", OOM_POLICY, "0",
+    )
+    if not isinstance(job, str) or not job.startswith("/org/freedesktop/systemd1/job/"):
+        raise ScopeVerificationError("systemd scope job was unreadable")
     while time.monotonic() < deadline:
-        if (now := _pid_cgroup()) is not None and not _inside(now, unit_cgroup):
-            return True
+        if (now := _pid_cgroup()) and not _inside(now, unit["cgroup"]):
+            bus.verify_scope(name, now)
+            if _pid_cgroup() == now:
+                return
+            raise ScopeVerificationError("updater scope membership changed during verification")
         time.sleep(0.1)
-    return False
+    raise ScopeVerificationError("updater did not reach its scope before the deadline")
 
 
 def _left_running(units: list[dict], jobs: list[dict]) -> tuple[list[dict], list[dict], list[str]]:
@@ -631,11 +657,13 @@ def _describe(token: dict) -> str:
 def pause_at_commit_point() -> str | None:
     """Stop this install's gateways before the first checkout move; once per run.
 
-    Never refuses the update: the pause is protection, not a gate. When it cannot complete
+    Normally the pause is protection, not a gate. When it cannot complete
     (discovery or the durable record fails, a stop fails), the gateways run through the swap and
     the post-commit restart refreshes them, which is how POSIX updated before the pause existed.
-    ``None``, except under ``--force`` when a stop has not settled (``StopUnsettled``): then the
-    refusal, sticky for the run, which the caller turns into an exit before git writes a file."""
+    Returns a refusal before git writes a file if an updater escape cannot be verified or a
+    ``--force`` stop has not settled (``StopUnsettled``). Both refusals are sticky for the run."""
+    if _escape_failed:
+        return _ESCAPE_REFUSAL
     token = _RUN
     if token is None:
         return None
@@ -659,8 +687,12 @@ def _pause(token: dict) -> str | None:
     try:
         units, jobs = _discover_systemd(), _discover_launchd()
         units, jobs, notices = _left_running(units, jobs)
+        if _escape_failed:
+            return _ESCAPE_REFUSAL
         bare, more = _discover_bare({u["pid"] for u in units} | {j["pid"] for j in jobs})
     except Exception as exc:  # health: allow BLE001 -- a discovery that cannot finish stops nothing
+        if _escape_failed:
+            return _ESCAPE_REFUSAL
         print(f"  ⚠ Could not list the running gateways ({exc}); they keep running and are restarted after the update")
         return None
     for line in notices + more:
