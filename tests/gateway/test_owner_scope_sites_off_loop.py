@@ -261,7 +261,7 @@ def _publish_world(tmp_path, monkeypatch, names=("alpha", "beta")):
 @pytest.mark.asyncio
 async def test_site_api_recover_reconnect_reads_each_profile_off_the_loop(tmp_path, reads, n0, monkeypatch):
     from gateway.config import Platform
-    runner, adapter, homes, _auth, order, recovered, _handed = _publish_world(tmp_path, monkeypatch)
+    runner, adapter, homes, _auth, _order, recovered, _handed = _publish_world(tmp_path, monkeypatch)
     loop_ident = threading.get_ident()
     await runner._install_reconnected_adapter(Platform.API_SERVER, adapter)
     for home in homes:
@@ -275,7 +275,7 @@ async def test_site_api_recover_reconnect_reads_each_profile_off_the_loop(tmp_pa
 @pytest.mark.asyncio
 async def test_site_api_recover_startup_reads_each_profile_off_the_loop(tmp_path, reads, n0, monkeypatch):
     from gateway.config import Platform
-    runner, adapter, homes, _auth, order, recovered, _handed = _publish_world(tmp_path, monkeypatch)
+    runner, adapter, homes, _auth, _order, recovered, _handed = _publish_world(tmp_path, monkeypatch)
     loop_ident = threading.get_ident()
     count = await runner._start_aggregate_connect_results(
         [(Platform.API_SERVER, adapter, object(), "ok", None)], [], [])
@@ -309,7 +309,7 @@ class _Gate:
     async def blocked(self):
         try:
             await asyncio.wait_for(self.started.wait(), timeout=2)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             pytest.fail("adapter publication never suspended in prepare_owner_scope: "
                         "the profile read is not a separate step before installation")
 
@@ -317,7 +317,7 @@ class _Gate:
 @pytest.mark.asyncio
 async def test_publish_never_partial_reconnect(tmp_path, reads, n0, monkeypatch):
     from gateway.config import Platform
-    runner, adapter, homes, _auth, order, recovered, _handed = _publish_world(tmp_path, monkeypatch)
+    runner, adapter, _homes, _auth, order, recovered, _handed = _publish_world(tmp_path, monkeypatch)
     gate = _Gate(monkeypatch)
     task = asyncio.create_task(runner._install_reconnected_adapter(Platform.API_SERVER, adapter))
     await gate.blocked()
@@ -334,7 +334,7 @@ async def test_publish_never_partial_reconnect(tmp_path, reads, n0, monkeypatch)
 @pytest.mark.asyncio
 async def test_publish_never_partial_startup(tmp_path, reads, n0, monkeypatch):
     from gateway.config import Platform
-    runner, adapter, homes, _auth, order, recovered, _handed = _publish_world(tmp_path, monkeypatch)
+    runner, adapter, _homes, _auth, order, _recovered, _handed = _publish_world(tmp_path, monkeypatch)
     gate = _Gate(monkeypatch)
     task = asyncio.create_task(runner._start_aggregate_connect_results(
         [(Platform.API_SERVER, adapter, object(), "ok", None)], [], []))
@@ -350,7 +350,7 @@ async def test_publish_never_partial_startup(tmp_path, reads, n0, monkeypatch):
 @pytest.mark.asyncio
 async def test_cancel_during_prepare_reconnect_disposes_the_unpublished_adapter(tmp_path, reads, n0, monkeypatch):
     from gateway.config import Platform
-    runner, adapter, homes, _auth, order, recovered, handed = _publish_world(tmp_path, monkeypatch)
+    runner, adapter, _homes, _auth, order, _recovered, handed = _publish_world(tmp_path, monkeypatch)
     gate = _Gate(monkeypatch)
     task = asyncio.create_task(runner._install_reconnected_adapter(Platform.API_SERVER, adapter))
     await gate.blocked()
@@ -367,7 +367,7 @@ async def test_cancel_during_prepare_reconnect_disposes_the_unpublished_adapter(
 @pytest.mark.asyncio
 async def test_cancel_during_prepare_startup_disconnects_the_unpublished_adapter(tmp_path, reads, n0, monkeypatch):
     from gateway.config import Platform
-    runner, adapter, homes, _auth, order, recovered, _handed = _publish_world(tmp_path, monkeypatch)
+    runner, adapter, _homes, _auth, order, _recovered, _handed = _publish_world(tmp_path, monkeypatch)
     gate = _Gate(monkeypatch)
     task = asyncio.create_task(runner._start_aggregate_connect_results(
         [(Platform.API_SERVER, adapter, object(), "ok", None)], [], []))
@@ -384,7 +384,7 @@ async def test_cancel_during_prepare_startup_disconnects_the_unpublished_adapter
 async def test_prepare_failure_degrades_one_authority(tmp_path, reads, n0, monkeypatch, caplog):
     import logging
     from gateway.config import Platform
-    runner, adapter, homes, authorities, order, recovered, _handed = _publish_world(tmp_path, monkeypatch)
+    runner, adapter, homes, _authorities, order, recovered, _handed = _publish_world(tmp_path, monkeypatch)
     gate = _Gate(monkeypatch, fail_for=[str(homes[1])])
     gate.release.set()
     with caplog.at_level(logging.WARNING):
@@ -401,7 +401,7 @@ async def test_prepare_failure_degrades_one_authority(tmp_path, reads, n0, monke
 async def test_authority_added_or_retired_during_prepare(tmp_path, reads, n0, monkeypatch, caplog):
     import logging
     from gateway.config import Platform
-    runner, adapter, homes, authorities, order, recovered, _handed = _publish_world(tmp_path, monkeypatch)
+    runner, adapter, homes, authorities, _order, recovered, _handed = _publish_world(tmp_path, monkeypatch)
     live = list(authorities)
     runner.session_authorities = SimpleNamespace(serving=lambda: list(live))
     gate = _Gate(monkeypatch)
@@ -421,7 +421,7 @@ async def test_authority_added_or_retired_during_prepare(tmp_path, reads, n0, mo
 def test_publish_is_synchronous_between_install_and_voice_wiring(tmp_path, monkeypatch):
     """A caller that does not await sees the adapter installed, recovered and wired at once."""
     from gateway.config import Platform
-    runner, adapter, homes, _auth, order, recovered, _handed = _publish_world(tmp_path, monkeypatch)
+    runner, adapter, _homes, _auth, order, _recovered, _handed = _publish_world(tmp_path, monkeypatch)
     runner._publish_primary_adapter(Platform.API_SERVER, adapter)
     assert runner.adapters[Platform.API_SERVER] is adapter
     assert order == ["recover", "recover", "voice_sync", "voice_bind"]
@@ -434,7 +434,7 @@ async def test_unrouted_owner_binds_its_prepared_scope_without_reading_or_warnin
     import logging
     from gateway import session_api_turn
     from gateway.session_authorities import owner_scope
-    runner, adapter, homes, authorities, order, recovered, _handed = _publish_world(tmp_path, monkeypatch)
+    runner, adapter, homes, authorities, _order, recovered, _handed = _publish_world(tmp_path, monkeypatch)
     unrouted = SimpleNamespace(profile_id="fixture", runner=SimpleNamespace(config=SimpleNamespace(multiplex_profiles=False)))
     runner.session_authorities = SimpleNamespace(serving=lambda: [unrouted, authorities[0]])
     with owner_scope(unrouted):
@@ -497,7 +497,7 @@ async def test_site_detached_mounted_a_draining_store_still_leaves_the_event_unc
     def draining():
         raise RuntimeStoreError("runtime_draining")
 
-    home, runner, evt, restored = _detached_world(tmp_path, monkeypatch, restore=draining)
+    _home, runner, evt, _restored = _detached_world(tmp_path, monkeypatch, restore=draining)
     before = _bound()
     assert await follow_detached_pin(runner, evt) == evt
     assert _bound() == before, "the scope leaked past the mount"
@@ -608,7 +608,7 @@ async def test_site_session_usage_account_usage_reads_off_the_loop(tmp_path, rea
         return None
 
     authority = _session_authority(home, resolve=resolve)
-    monkeypatch.setattr(session_llm_oneshot, "_session_runtime", lambda auth, ref: (lambda: {}))
+    monkeypatch.setattr(session_llm_oneshot, "_session_runtime", lambda auth, ref: (dict))
     monkeypatch.setattr(account_usage_module, "account_limit_lines", lambda *a, **k: [])
     monkeypatch.setattr(account_usage_nous, "nous_usage_view", lambda **k: ([], None))
     monkeypatch.setattr(billing_usage, "usage_model_wire", lambda usage: None)
@@ -706,7 +706,7 @@ async def test_site_session_hosted_transport_source_handler_runs_on_a_control_wo
         seen.append(threading.current_thread().name)
         return {"owner": "o"}
 
-    home, out = await _hosted_dispatch(tmp_path, "hosted-attest", {
+    home, _out = await _hosted_dispatch(tmp_path, "hosted-attest", {
         "selector": {"room_id": "r", "member_id": "m", "profile": "p"}, "operation": "submit", "params": {}}, attest)
     assert seen and seen[0].startswith("gateway-control")
     _assert_reach(reads, home, n0)
