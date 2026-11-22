@@ -260,6 +260,11 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
     """
     # The process's async-delegation ledger belongs to the adopted execution, never a reserved child.
     binds_delegation_ledger = True
+    # A renewal queues behind the persist retry on ``self.lock`` and can block for the whole owner-silence
+    # budget. The lease must outlive: refresh interval (60) + budget + one receipt attempt + max backoff (8)
+    # + expiry margin (2) + slack (60); tests/agent/test_turn_lease_outage_survival.py enforces it.
+    # SessionDB keeps 300 s. The owner accepts 0.1-3600 s, so there is no protocol change.
+    turn_lease_ttl_seconds = 600.0
 
     def __init__(self, rpc, scope, outbox_dir, adopted=None, *, max_bytes=4 * 1024 * 1024):
         self.rpc = rpc
