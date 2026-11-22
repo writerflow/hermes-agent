@@ -4,7 +4,9 @@ import pytest
 from agent.runtime_session_store import RuntimeSessionStore
 
 
-def test_reopen_reconciles_pending_receipt_before_new_write(tmp_path):
+def test_reopen_reconciles_pending_receipt_before_new_write(tmp_path, monkeypatch):
+    # A lost reply is retried for the owner-silence budget; this test is about the pending receipt, not the wait.
+    monkeypatch.setattr('agent.runtime_session_store.OWNER_SILENCE_BUDGET_S', 0.0)
     calls = []
     def lost_reply(method, **params):
         calls.append(params)

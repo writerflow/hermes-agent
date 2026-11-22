@@ -20,8 +20,11 @@ from typing import Optional
 # and a failed exit here spends the card's failure budget and lets the owner end the turn. Asking
 # again is safe: ``kanban.run`` is idempotent per attempt and ``prompt.receipt`` is a read.
 # ``OWNER_WAIT_S`` is the longest the owner may stay silent between answers before the worker
-# gives up (the first ``kanban.run`` answer has its own wait, ``admission_answer_budget``).
-OWNER_WAIT_S = 180.0
+# gives up. It must outlast the worker's persist retry (``OWNER_SILENCE_BUDGET_S`` 420 s plus one 20 s
+# receipt attempt): the turn's ``_watch_submitter`` ties the managed worker's life to this process, so a
+# submitter that quit first would end a turn still inside its budget. Pinned by
+# tests/agent/test_worker_persist_owner_silence_retry.py.
+OWNER_WAIT_S = 440.0
 # Past the board lock wait: the owner's session setup and receipt before and after the write.
 ADMISSION_ANSWER_MARGIN_S = 60.0
 
