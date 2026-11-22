@@ -906,18 +906,39 @@ class GatewayAdapterLifecycleMixin(GatewaySecondaryReconnectMixin):
         logger.warning("Reconnect %s: %s, removing from retry queue", platform.value, reason)
         del self._failed_platforms[platform]
 
-    def _publish_primary_adapter(self, platform, adapter) -> None:
-        """Register a connected primary adapter and wire voice mode/input (transcription without /voice join)."""
+    async def _prepare_primary_adapter(self, platform, adapter, dispose):
+        """The only await of publication: read each profile's scope for API-turn recovery in a worker
+        (``None`` for other platforms). Nothing is installed yet, so on cancellation the connected
+        but unowned adapter is released through ``dispose`` and the cancel propagates."""
+        if platform != Platform.API_SERVER:
+            return None
+        from gateway.session_api_turn import prepare_api_recovery
+        try:
+            return await prepare_api_recovery(adapter)
+        except asyncio.CancelledError:
+            await asyncio.shield(dispose())
+            raise
+
+    def _publish_primary_adapter(self, platform, adapter, prepared=None) -> None:
+        """Register a connected primary adapter and wire voice mode/input (transcription without /voice join).
+        Never awaits: install, API recovery and voice wiring happen in one loop step, so no coroutine
+        observes a half-published adapter. ``prepared`` comes from ``_prepare_primary_adapter``."""
         self.adapters[platform] = adapter
         if platform == Platform.API_SERVER:
             from gateway.session_api_turn import recover_api_turns
-            recover_api_turns(adapter)
+            recover_api_turns(adapter, prepared)
         self._sync_voice_mode_state_to_adapter(adapter)
         self._bind_voice_input_callback(adapter)
 
     async def _install_reconnected_adapter(self, platform, adapter) -> None:
         """Publish a freshly reconnected primary adapter and replay what it missed while down."""
-        self._publish_primary_adapter(platform, adapter)
+        async def dispose():
+            from gateway.run import _dispose_unused_adapter
+            await _dispose_unused_adapter(adapter)
+            hand_over_held_inbound(adapter, self._failed_platforms[platform].get("predecessor"))
+
+        prepared = await self._prepare_primary_adapter(platform, adapter, dispose)
+        self._publish_primary_adapter(platform, adapter, prepared)
         self.delivery_router.adapters = self.adapters
         hand_over_held_inbound(self._failed_platforms.pop(platform).get("predecessor"), adapter)
         # connect() returning True does not mean the receive path is confirmed -- Telegram's degraded

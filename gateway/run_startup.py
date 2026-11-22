@@ -1355,7 +1355,9 @@ class GatewayStartupMixin:
                 )
                 continue
             if outcome == "ok":
-                self._publish_primary_adapter(platform, adapter)
+                prepared = await self._prepare_primary_adapter(
+                    platform, adapter, lambda: self._safe_adapter_disconnect(adapter, platform))
+                self._publish_primary_adapter(platform, adapter, prepared)
                 connected_count += 1
                 # connect() may return True on a degraded (unconfirmed) receive path; don't stamp "connected".
                 _degraded = adapter.send_path_degraded
