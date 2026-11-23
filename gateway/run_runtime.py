@@ -622,9 +622,9 @@ async def _recover_profile_bot_mailbox(runner, authority):
     be recovered is parked like one whose store cannot be opened (retired, unreserved, named under
     ``parked_profiles``): under multiplex it would otherwise take every other profile down with it,
     on every restart (#140018). The launch profile's failure still aborts the start."""
-    from gateway.session_authorities import owner_scope
+    from gateway.session_authorities import async_owner_scope
     try:
-        with owner_scope(authority):
+        async with async_owner_scope(authority):
             await recover_bot_mailbox(authority)
     except Exception as exc:
         registry = getattr(runner, 'session_authorities', None)
