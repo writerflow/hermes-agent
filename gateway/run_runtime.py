@@ -452,7 +452,7 @@ async def serve_profile_runtime(runner, name, home):
     publish it in the descriptor/ticket store — the steps boot performs per secondary. Raises when
     the profile's store is unusable; the caller parks it (and releases the reservation). Its
     queued native rows are recovered once its adapters connect (``recover_served_native_rows``)."""
-    from gateway.session_authorities import owner_scope
+    from gateway.session_authorities import async_owner_scope
     from gateway.session_hosted_service import _ensure_hosted_service, start_ready_hosted_services
     from gateway.session_local_recovery import recover_local_sessions
     from gateway.platforms.webhook_ingress import recover_webhook_finalizations
@@ -470,7 +470,7 @@ async def serve_profile_runtime(runner, name, home):
         return existing
     authority = await _build_profile_authority(runner, name, home, register=False)
     try:
-        with owner_scope(authority):
+        async with async_owner_scope(authority):
             _drop_retired_local_adapter(authority)
             await recover_bot_mailbox(authority)
             recover_local_sessions(authority, schedule=True)
@@ -622,9 +622,9 @@ async def _recover_profile_bot_mailbox(runner, authority):
     be recovered is parked like one whose store cannot be opened (retired, unreserved, named under
     ``parked_profiles``): under multiplex it would otherwise take every other profile down with it,
     on every restart (#140018). The launch profile's failure still aborts the start."""
-    from gateway.session_authorities import owner_scope
+    from gateway.session_authorities import async_owner_scope
     try:
-        with owner_scope(authority):
+        async with async_owner_scope(authority):
             await recover_bot_mailbox(authority)
     except Exception as exc:
         registry = getattr(runner, 'session_authorities', None)
@@ -654,7 +654,7 @@ async def recover_gateway_native_sessions(runner):
     Stored envelopes are input, not authority to create a route or reconnect a
     transport. The authority preflights every queued sender before any claim.
     """
-    from gateway.session_authorities import owner_scope, serving_authorities
+    from gateway.session_authorities import async_owner_scope, serving_authorities
     authorities = serving_authorities(runner)
     if not authorities:
         return {}
@@ -664,7 +664,7 @@ async def recover_gateway_native_sessions(runner):
     from gateway.platforms.webhook_ingress import recover_webhook_finalizations
     results = {}
     for authority in authorities:
-        with owner_scope(authority):
+        async with async_owner_scope(authority):
             recover_local_sessions(authority, schedule=True)
             await recover_webhook_finalizations(authority)
         results.update(await recover_profile_native_sessions(runner, authority))
@@ -685,9 +685,9 @@ def _prime_recovered_egress(bindings):
 
 async def recover_profile_native_sessions(runner, authority):
     """Bind one authority's queued native rows to the adapters connected now."""
-    from gateway.session_authorities import owner_scope
+    from gateway.session_authorities import async_owner_scope
     from gateway.session_native_recovery_routes import recovered_native_source
-    with owner_scope(authority):
+    async with async_owner_scope(authority):
         pending = {row['target_session_id'] for row in authority.db._read_all(
             "SELECT DISTINCT target_session_id FROM session_admissions WHERE status IN ('queued','unknown')")}
         bindings = [(owner, origin, runner._adapter_for_source(origin))
