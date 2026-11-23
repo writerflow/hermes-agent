@@ -897,7 +897,7 @@ def _launch_hosting(launch, monkeypatch):
 
 # --- Site 2: GatewayRuntimeAPI._serve (run_api.py), one scope per WebSocket connection ---------------
 
-def _attach_world(tmp_path, monkeypatch, name="ws-serve"):
+def _attach_world(tmp_path, monkeypatch, name="ws-serve", *, unrouted=False):
     """Attach over the real ``/api/ws`` admission for a routed (multiplexed) owner with its own home.
 
     Returns ``(home, authority, runner, handled, sent, start)``; ``start()`` makes the connection.
@@ -913,7 +913,7 @@ def _attach_world(tmp_path, monkeypatch, name="ws-serve"):
     tickets = TicketStore("owner", [str(home)])
     ticket = tickets.mint(profile_id=str(home), subject="human", purpose="interactive")
     authority = SimpleNamespace(db=SimpleNamespace(db_path=home / "state.db"), profile_id=str(home),
-                                runner=SimpleNamespace(config=SimpleNamespace(multiplex_profiles=True)))
+                                runner=SimpleNamespace(config=SimpleNamespace(multiplex_profiles=not unrouted)))
     runner = SimpleNamespace(_draining=False, session_runtime_descriptor={"state": "ready"},
                              session_authority=authority, session_ticket_store=tickets)
     handled, sent = [], []
@@ -1287,7 +1287,7 @@ async def test_site_cron_local_delivery_looks_the_chat_up_only_after_the_hop(tmp
 
 # --- Site 8: cron operation ``submit`` (session_cron.py), one scope per cron submit -------------------
 
-def _submit_world(tmp_path, monkeypatch):
+def _submit_world(tmp_path, monkeypatch, *, unrouted=False):
     """The real ``operation(authority, 'submit', ...)`` with the real admission check; ``_create`` records."""
     import types
     from gateway import session_cron, session_runtime_workers
@@ -1296,6 +1296,7 @@ def _submit_world(tmp_path, monkeypatch):
     home = _make_home(tmp_path, "submit").resolve()
     authority = _authority(home, db=SimpleNamespace(), epoch=1, retiring=False, retired=False)
     authority.runner._draining = False
+    authority.runner.config.multiplex_profiles = not unrouted
     authority._require_admission_open = types.MethodType(SessionAuthority._require_admission_open, authority)
     authority._admission_gate = lambda *a, **k: None
     authority._admitted = lambda *a, **k: None
@@ -1396,3 +1397,33 @@ async def test_site_onboarding_start_reads_the_sibling_profile_off_the_loop(tmp_
     assert reads.reads_for(asking) == []  # the asking profile's scope belongs to dispatch, not to this call
     assert entered == [(threading.get_ident(), expected)]
     assert expected["home"] == str(home)
+
+
+# --- Unrouted owners at the two sites that bind a prepared scope themselves (sites 2 and 8) -----------
+# A symbolic or single-profile owner prepares ``None``; binding it must give exactly what the sync
+# ``owner_scope`` gives (the launch scope under multi-profile hosting), with no profile read.
+
+@pytest.mark.asyncio
+async def test_site_ws_serve_unrouted_owner_binds_the_launch_scope(tmp_path, reads, n0, monkeypatch):
+    launch = _make_home(tmp_path, "launch-ws")
+    with _launch_hosting(launch, monkeypatch):
+        home, authority, _runner, handled, _sent, start = _attach_world(tmp_path, monkeypatch, unrouted=True)
+        expected = _expected_scope(authority)
+        assert expected["home"] == str(launch) and expected["secrets"]
+        reads.reads.clear()
+        await start()
+    assert [b for _t, b in handled] == [expected]
+    assert reads.reads_for(home) == []
+
+
+@pytest.mark.asyncio
+async def test_site_cron_submit_unrouted_owner_binds_the_launch_scope(tmp_path, reads, n0, monkeypatch):
+    launch = _make_home(tmp_path, "launch-cron")
+    with _launch_hosting(launch, monkeypatch):
+        home, authority, created, params, session_cron = _submit_world(tmp_path, monkeypatch, unrouted=True)
+        expected = _expected_scope(authority)
+        assert expected["home"] == str(launch) and expected["secrets"]
+        reads.reads.clear()
+        await session_cron.operation(authority, "submit", params)
+    assert created == [(threading.get_ident(), expected)]
+    assert reads.reads_for(home) == []
