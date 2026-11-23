@@ -519,6 +519,19 @@ class TestPropertySet:
 # --------------------------------------------------------------------------- T4: kill, timeout, yield
 @pytest.mark.platforms("linux")
 class TestScopeLifecycle:
+    def test_unresolved_creation_never_stops_a_same_name_unit(self, worker_host, fg_config, stub_factory,
+                                                               make_env, monkeypatch, tmp_path):
+        fg_config()
+        stub = stub_factory("no_bus")
+        # A request with no reply: the wrapper stays alive without executing its payload.
+        (stub.bindir / "systemd-run").write_text("#!/usr/bin/env bash\nexec sleep 30\n")
+        stopped = self._spy_stop(monkeypatch)
+        marker = tmp_path / "payload"
+        result = make_env().execute(f"touch {marker}", resource_scope=True, timeout=1)
+        assert result["returncode"] == 124
+        assert not marker.exists()
+        assert stopped == []
+
     def _spy_stop(self, monkeypatch, result=True):
         stopped: list[str] = []
         real = pr._stop_systemd_unit
