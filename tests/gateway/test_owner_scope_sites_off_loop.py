@@ -745,3 +745,154 @@ async def test_site_session_hosted_transport_target_handler_runs_on_a_producer_w
     _assert_reach(reads, home, n0)
     _assert_off_loop(reads, home, threading.get_ident())
     assert reads.reads_for(home)[0][1].startswith("gateway-hosted-producer")
+
+
+# --- The 9 sync ``with owner_scope`` sites in coroutines (t_9328163d) -------------------------------------
+# Each case drives the real public entry, passes the reach assertion on the unchanged tree (the site read
+# the profile files, so the fixture reached it) and fails location there until the site is moved off the loop.
+
+def _expected_scope(authority):
+    from gateway.session_authorities import owner_scope
+    with owner_scope(authority):
+        return _bound()
+
+
+class _HopGate:
+    """Holds the worker-thread profile read (``_prepare_owner_scope``) open until released."""
+
+    def __init__(self, monkeypatch):
+        from gateway import session_authorities
+        self.entered, self.release = threading.Event(), threading.Event()
+        real = session_authorities._prepare_owner_scope
+
+        def gated(home):
+            self.entered.set()
+            assert self.release.wait(10), "hop gate never released"
+            return real(home)
+
+        monkeypatch.setattr(session_authorities, "_prepare_owner_scope", gated)
+
+    async def wait_entered(self):
+        for _ in range(500):
+            if self.entered.is_set():
+                return
+            await asyncio.sleep(0.01)
+        pytest.fail("the site never made the worker-thread profile read (no hop)")
+
+
+# --- Site 1: HostedRoomAuthorityRPC._dispatch (session_hosted_rpc.py) ---------------------------------
+
+def _hosted_rpc(tmp_path, monkeypatch, *, timeout=30, home_name="hosted-rpc"):
+    from gateway.session_hosted_rpc import HostedRoomAuthorityRPC
+    home = _make_home(tmp_path, home_name)
+    authority = _authority(home)
+    principal = SimpleNamespace(subject="alice", profile_id=str(home))
+    rpc = HostedRoomAuthorityRPC(authority, asyncio.get_running_loop(), room_id="room", member_id="m",
+                                 profile="default", principal=principal, authorize=lambda *a: True,
+                                 timeout=timeout)
+    owned = []
+
+    async def dispatch_owned(operation, params):
+        owned.append((operation, threading.get_ident(), _bound()))
+        return {"ok": operation}
+
+    monkeypatch.setattr(rpc, "_dispatch_owned", dispatch_owned)
+    return home, authority, rpc, owned
+
+
+@pytest.mark.asyncio
+async def test_site_hosted_rpc_dispatch_reads_the_profile_off_the_loop(tmp_path, reads, n0, monkeypatch):
+    home, _authority_, rpc, owned = _hosted_rpc(tmp_path, monkeypatch)
+    assert await asyncio.to_thread(rpc._call, "submit") == {"ok": "submit"}
+    _assert_reach(reads, home, n0)
+    _assert_off_loop(reads, home, threading.get_ident())
+    assert len(owned) == 1 and owned[0][1] == threading.get_ident()  # the guarded work stays on the loop
+
+
+@pytest.mark.asyncio
+async def test_site_hosted_rpc_dispatch_binds_what_owner_scope_binds(tmp_path, reads, n0, monkeypatch):
+    home, authority, rpc, owned = _hosted_rpc(tmp_path, monkeypatch)
+    expected = _expected_scope(authority)
+    assert expected["home"] == str(home)
+    await asyncio.to_thread(rpc._call, "submit")
+    assert [b for _o, _t, b in owned] == [expected]
+    assert _bound()["home"] != str(home), "the scope leaked past the dispatch"
+
+
+@pytest.mark.asyncio
+async def test_site_hosted_rpc_timeout_during_the_hop_never_cancels_the_dispatch(tmp_path, reads, n0, monkeypatch):
+    """A caller timeout is ambiguous: the dispatch is not cancelled, so it may still admit, once, under the owner."""
+    home, authority, rpc, owned = _hosted_rpc(tmp_path, monkeypatch, timeout=0.2)
+    expected = _expected_scope(authority)
+    reads.reads.clear()
+    gate = _HopGate(monkeypatch)
+    call = asyncio.create_task(asyncio.to_thread(rpc._call, "submit"))
+    await gate.wait_entered()
+    with pytest.raises(TimeoutError):
+        await call
+    assert owned == []  # still inside the hop
+    gate.release.set()
+    for _ in range(500):
+        if owned:
+            break
+        await asyncio.sleep(0.01)
+    await asyncio.sleep(0.05)
+    assert [b for _o, _t, b in owned] == [expected], "the timed-out dispatch must still complete once, under the owner"
+    _assert_off_loop(reads, home, threading.get_ident())
+
+
+@pytest.mark.asyncio
+async def test_site_hosted_rpc_task_cancellation_during_the_hop_runs_nothing(tmp_path, reads, n0, monkeypatch):
+    home, _authority_, rpc, owned = _hosted_rpc(tmp_path, monkeypatch)
+    before = _bound()
+    gate = _HopGate(monkeypatch)
+    task = asyncio.create_task(rpc._dispatch("submit", {}))
+    await gate.wait_entered()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    gate.release.set()
+    await asyncio.sleep(0.1)
+    assert owned == [] and _bound() == before
+    assert reads.on_loop(home, threading.get_ident()) == []
+
+
+@pytest.mark.asyncio
+async def test_site_hosted_rpc_unrouted_owner_reads_nothing_and_binds_the_launch_scope(tmp_path, reads, n0, monkeypatch):
+    from gateway.session_hosted_rpc import HostedRoomAuthorityRPC
+    launch = _make_home(tmp_path, "launch")
+    with _launch_hosting(launch, monkeypatch):
+        authority = SimpleNamespace(profile_id="fixture", runner=SimpleNamespace(config=SimpleNamespace(multiplex_profiles=False)))
+        expected = _expected_scope(authority)
+        assert expected["home"] == str(launch) and expected["secrets"]
+        principal = SimpleNamespace(subject="alice", profile_id="fixture")
+        rpc = HostedRoomAuthorityRPC(authority, asyncio.get_running_loop(), room_id="room", member_id="m",
+                                     profile="default", principal=principal, authorize=lambda *a: True)
+        got = []
+
+        async def dispatch_owned(operation, params):
+            got.append(_bound())
+
+        monkeypatch.setattr(rpc, "_dispatch_owned", dispatch_owned)
+        reads.reads.clear()
+        await asyncio.to_thread(rpc._call, "submit")
+    assert got == [expected]
+    assert reads.reads_for(Path("fixture")) == []
+
+
+from contextlib import contextmanager  # noqa: E402
+
+
+@contextmanager
+def _launch_hosting(launch, monkeypatch):
+    """Host several profiles (as the unrouted case above does) so an unrouted owner binds the launch scope."""
+    from agent import secret_scope
+    from tui_gateway import launch_profile_policy
+    monkeypatch.setenv("HERMES_HOME", str(launch))
+    monkeypatch.setattr(launch_profile_policy, "_snapshot", None)
+    previous = secret_scope.is_multiplex_active()
+    launch_profile_policy.activate_multi_profile_hosting()
+    try:
+        yield
+    finally:
+        secret_scope.set_multiplex_active(previous)
