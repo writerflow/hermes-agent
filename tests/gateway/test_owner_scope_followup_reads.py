@@ -9,6 +9,34 @@ import pytest
 from tests.gateway.test_hosted_mux_runtime import mux  # noqa: F401
 
 
+def test_cron_create_job_read_is_off_loop(mux, monkeypatch):
+    from cron import jobs
+    from gateway import session_cron
+
+    runner, homes, loop, call = mux
+    authority = runner.session_authorities.require(homes['beta'])
+    with jobs.use_cron_store(homes['beta'] / 'cron'):
+        job = jobs.create_job(prompt='report', schedule='every 1h', deliver='local', model='fixture')
+    observed = []
+    real = jobs.get_job
+
+    def probe(job_id):
+        observed.append((jobs._current_cron_store().cron_dir.resolve(), threading.get_ident()))
+        return real(job_id)
+
+    async def loop_thread():
+        return threading.get_ident()
+
+    loop_ident = call(loop_thread())
+    monkeypatch.setattr(jobs, 'get_job', probe)
+    result = call(session_cron.operation(authority, 'submit', {
+        'job_id': job['id'], 'request_id': 'fresh', 'extra_prompt': None}))
+    assert authority.db.get_session(result['session_id']) is not None
+    assert observed, 'cron submit did not reach jobs reader'
+    assert all(path == (homes['beta'] / 'cron').resolve() for path, _ in observed), observed
+    assert all(ident != loop_ident for _, ident in observed), 'cron job read on owner loop'
+
+
 def test_hosted_create_config(mux, monkeypatch):
     from gateway import run
     from gateway.session_contract import SessionActor
