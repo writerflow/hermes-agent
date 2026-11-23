@@ -114,10 +114,35 @@ def test_hosted_cancel_retains_physical_reader_until_settled(mux, monkeypatch):
 
     monkeypatch.setattr(run, '_load_gateway_config', held_read)
     task = call(begin())
+    async def settle_reads():
+        await asyncio.gather(*mutation_tasks(authority))
+
     try:
         assert entered.wait(20), 'hosted create did not reach config reader'
         assert call(cancel_and_count(task)) >= 1, 'retirement lost the physical read'
     finally:
         release.set()
         assert finished.wait(30)
+        call(settle_reads())
     assert authority.db.get_session(rpc.ref.session_id) is None
+
+
+def test_hosted_exact_retry_avoids_broken_config(mux, monkeypatch):
+    from gateway import run
+    from gateway.session_contract import SessionActor
+    from gateway.session_hosted_rpc import HostedRoomAuthorityRPC
+
+    runner, homes, loop, _ = mux
+    authority = runner.session_authorities.require(homes['beta'])
+    actor = SessionActor('alice', authority.profile_id,
+                         frozenset({'session:create', 'session:read'}), 'private-owner')
+    rpc = HostedRoomAuthorityRPC(authority, loop, room_id='retry', member_id='helper',
+                                 profile='beta', principal=actor, authorize=lambda *args: True)
+    params = {'profile': 'beta', 'source': 'bot_room', 'title': 'Group: retry'}
+    created = rpc.create(**params)
+
+    def broken(*args, **kwargs):
+        raise AssertionError('exact retry read config')
+
+    monkeypatch.setattr(run, '_load_gateway_config', broken)
+    assert rpc.create(**params) == created
