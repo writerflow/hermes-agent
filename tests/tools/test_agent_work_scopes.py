@@ -35,6 +35,25 @@ def test_failed_retained_scope_probe_cannot_degrade_on_warm_cache(monkeypatch, s
 
 
 @pytest.mark.platforms("linux")
+def test_retained_dispatch_refuses_if_scope_helper_disappears_after_probe(monkeypatch):
+    monkeypatch.setenv("INVOCATION_ID", "fixture-invocation")
+    monkeypatch.setattr(process_registry, "_is_supervised_gateway_process", lambda: True)
+    monkeypatch.setattr(process_registry, "_SYSTEMD_SCOPE_AVAILABLE", None)
+    binaries = iter(("/usr/bin/systemd-run", None))
+    monkeypatch.setattr("shutil.which", lambda name: next(binaries))
+
+    def manager(argv, **kwargs):
+        assert "OOMPolicy=continue" in argv
+        return subprocess.CompletedProcess(argv, 0, b"", b"")
+
+    monkeypatch.setattr(process_registry.subprocess, "run", manager)
+    with pytest.raises(process_registry.RestartSafeScopeUnavailable, match="disappeared"):
+        process_registry.restart_safe_gateway_child_argv(
+            ["payload"], unit_suffix="lost-helper", require_restart_safe_scope=False,
+        )
+
+
+@pytest.mark.platforms("linux")
 @pytest.mark.parametrize("bus, scope", [("--user", "user"), ("--system", "system")])
 @pytest.mark.parametrize("policy", ["continue", "stop", "kill", "changed invocation", "replaced cgroup", None])
 def test_escape_checks_policy_before_update_can_switch(monkeypatch, tmp_path, bus, scope, policy):

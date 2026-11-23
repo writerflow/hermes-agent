@@ -332,8 +332,9 @@ def _build_systemd_scope_argv(shell_argv: list[str], unit_suffix: str) -> list[s
 
     binary = shutil.which("systemd-run")
     if binary is None:
-        # Caller should have probed availability; never pass None into Popen anyway.
-        return shell_argv
+        # A successful probe is not evidence that the launch helper still exists.
+        # In particular, do not return argv that would run inside the gateway.
+        raise RestartSafeScopeUnavailable("systemd-run disappeared after the availability probe")
     return _systemd_scope_argv(binary, f"hermes-worker-{unit_suffix}", *shell_argv)
 
 
@@ -459,10 +460,7 @@ def restart_safe_gateway_child_argv(
             f"/run/user/{os.getuid()}/bus). On a system-level service install, run "  # windows-footgun: ok — behind the _IS_LINUX return above
             "`sudo loginctl enable-linger <gateway-user>` and restart the gateway."
         )
-    scoped = _build_systemd_scope_argv(command, unit_suffix=unit_suffix)
-    if scoped == command:
-        return _degrade("systemd-run disappeared after the availability probe")
-    return GatewayChildDispatch("scoped", scoped)
+    return GatewayChildDispatch("scoped", _build_systemd_scope_argv(command, unit_suffix=unit_suffix))
 
 
 def _stop_systemd_unit(unit_name: str) -> bool:
@@ -1115,8 +1113,9 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
         # This applies to both pipe mode and the PTY path above. See #70716.
         in_supervised_gateway = _IS_LINUX and _is_supervised_gateway_process()
         if in_supervised_gateway and _systemd_run_user_scope_available():
+            scoped = _build_systemd_scope_argv(argv, unit_suffix=unit_suffix)
             session.systemd_unit = f"hermes-worker-{unit_suffix}.scope"
-            return _build_systemd_scope_argv(argv, unit_suffix=unit_suffix)
+            return scoped
         if in_supervised_gateway:
             # Under a supervisor but no private cgroup: a worker OOM can still take
             # the whole gateway down.
