@@ -685,9 +685,9 @@ def _prime_recovered_egress(bindings):
 
 async def recover_profile_native_sessions(runner, authority):
     """Bind one authority's queued native rows to the adapters connected now."""
-    from gateway.session_authorities import owner_scope
+    from gateway.session_authorities import async_owner_scope
     from gateway.session_native_recovery_routes import recovered_native_source
-    with owner_scope(authority):
+    async with async_owner_scope(authority):
         pending = {row['target_session_id'] for row in authority.db._read_all(
             "SELECT DISTINCT target_session_id FROM session_admissions WHERE status IN ('queued','unknown')")}
         bindings = [(owner, origin, runner._adapter_for_source(origin))
