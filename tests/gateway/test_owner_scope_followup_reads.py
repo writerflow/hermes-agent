@@ -9,6 +9,43 @@ import pytest
 from tests.gateway.test_hosted_mux_runtime import mux  # noqa: F401
 
 
+@pytest.mark.parametrize('site', ['session', 'config'])
+def test_cron_create_other_reads_are_off_loop(mux, monkeypatch, site):
+    from cron import jobs
+    from gateway import run, session_cron
+
+    runner, homes, loop, call = mux
+    authority = runner.session_authorities.require(homes['beta'])
+    with jobs.use_cron_store(homes['beta']):
+        job = jobs.create_job(prompt='report', schedule='every 1h', deliver='local', model='fixture')
+    observed = []
+    if site == 'session':
+        real = authority.db.get_session
+        def probe(*args, **kwargs):
+            if not observed:
+                observed.append((Path(authority.db.db_path).resolve().parent, threading.get_ident()))
+            return real(*args, **kwargs)
+        monkeypatch.setattr(authority.db, 'get_session', probe)
+    else:
+        real = run._load_gateway_config
+        def probe(config_path=None):
+            home = Path(config_path).parent if config_path is not None else run._gateway_config_home()
+            observed.append((Path(home).resolve(), threading.get_ident()))
+            return real(config_path)
+        monkeypatch.setattr(run, '_load_gateway_config', probe)
+
+    async def loop_thread():
+        return threading.get_ident()
+
+    loop_ident = call(loop_thread())
+    result = call(session_cron.operation(authority, 'submit', {
+        'job_id': job['id'], 'request_id': 'fresh', 'extra_prompt': None}))
+    assert result['session_id']
+    assert observed, f'cron submit did not reach {site} reader'
+    assert all(home == homes['beta'].resolve() for home, _ in observed), observed
+    assert all(ident != loop_ident for _, ident in observed), f'cron {site} read on owner loop'
+
+
 def test_cron_create_job_read_is_off_loop(mux, monkeypatch):
     from cron import jobs
     from gateway import session_cron
