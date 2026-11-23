@@ -13,7 +13,7 @@ fails instead of passing vacuously) and location (no read for the case's home on
 
 import asyncio
 import threading
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -802,7 +802,7 @@ def _hosted_rpc(tmp_path, monkeypatch, *, timeout=30, home_name="hosted-rpc"):
 
 @pytest.mark.asyncio
 async def test_site_hosted_rpc_dispatch_reads_the_profile_off_the_loop(tmp_path, reads, n0, monkeypatch):
-    home, _authority_, rpc, owned = _hosted_rpc(tmp_path, monkeypatch)
+    home, _auth, rpc, owned = _hosted_rpc(tmp_path, monkeypatch)
     assert await asyncio.to_thread(rpc._call, "submit") == {"ok": "submit"}
     _assert_reach(reads, home, n0)
     _assert_off_loop(reads, home, threading.get_ident())
@@ -843,7 +843,7 @@ async def test_site_hosted_rpc_timeout_during_the_hop_never_cancels_the_dispatch
 
 @pytest.mark.asyncio
 async def test_site_hosted_rpc_task_cancellation_during_the_hop_runs_nothing(tmp_path, reads, n0, monkeypatch):
-    home, _authority_, rpc, owned = _hosted_rpc(tmp_path, monkeypatch)
+    home, _auth, rpc, owned = _hosted_rpc(tmp_path, monkeypatch)
     before = _bound()
     gate = _HopGate(monkeypatch)
     task = asyncio.create_task(rpc._dispatch("submit", {}))
@@ -878,9 +878,6 @@ async def test_site_hosted_rpc_unrouted_owner_reads_nothing_and_binds_the_launch
         await asyncio.to_thread(rpc._call, "submit")
     assert got == [expected]
     assert reads.reads_for(Path("fixture")) == []
-
-
-from contextlib import contextmanager  # noqa: E402
 
 
 @contextmanager
