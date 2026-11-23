@@ -1360,3 +1360,39 @@ async def test_site_cron_submit_an_already_draining_authority_is_refused_before_
         await session_cron.operation(authority, "submit", params)
     assert raised.value.reason == "runtime_draining"
     assert created == [] and reads.reads_for(home) == []
+
+
+# --- Site 9: onboarding ``start`` (session_onboarding.py), one scope per call that hops to a sibling --
+
+def _onboarding_world(tmp_path, monkeypatch):
+    """A connection whose onboarding sibling (the default profile) owns the work; the real ``start`` recurses."""
+    from gateway import session_onboarding
+    home = _make_home(tmp_path, "onboarding-default").resolve()
+    asking = _make_home(tmp_path, "onboarding-asker").resolve()
+    target = SimpleNamespace(authority=_authority(home), actor=SimpleNamespace(capabilities=frozenset()),
+                             _sibling_for=lambda name: None)
+    connection = SimpleNamespace(authority=_authority(asking), actor=SimpleNamespace(capabilities=frozenset()),
+                                 _sibling_for=lambda name: target)
+    real_start, entered = session_onboarding.start, []
+
+    async def start(conn, ref, params):
+        if conn is target:
+            entered.append((threading.get_ident(), _bound()))
+            return {"started": True}
+        return await real_start(conn, ref, params)
+
+    monkeypatch.setattr(session_onboarding, "start", start)
+    return home, asking, target, connection, entered, real_start
+
+
+@pytest.mark.asyncio
+async def test_site_onboarding_start_reads_the_sibling_profile_off_the_loop(tmp_path, reads, n0, monkeypatch):
+    home, asking, target, connection, entered, real_start = _onboarding_world(tmp_path, monkeypatch)
+    expected = _expected_scope(target.authority)
+    reads.reads.clear()
+    assert await real_start(connection, None, {}) == {"started": True}
+    _assert_reach(reads, home, n0)  # one scope entry for the one hop
+    _assert_off_loop(reads, home, threading.get_ident())
+    assert reads.reads_for(asking) == []  # the asking profile's scope belongs to dispatch, not to this call
+    assert entered == [(threading.get_ident(), expected)]
+    assert expected["home"] == str(home)
