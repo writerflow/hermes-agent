@@ -183,3 +183,42 @@ def test_hosted_create_refuses_retirement_during_config(mux, monkeypatch):
         with pytest.raises(RuntimeStoreError, match='runtime_draining'):
             future.result(timeout=30)
     assert authority.db.get_session(rpc.ref.session_id) is None
+
+
+def test_hosted_concurrent_create_converges(mux, monkeypatch):
+    from gateway import run
+    from gateway.session_contract import SessionActor
+    from gateway.session_hosted_rpc import HostedRoomAuthorityRPC
+
+    runner, homes, loop, _ = mux
+    authority = runner.session_authorities.require(homes['beta'])
+    actor = SessionActor('alice', authority.profile_id,
+                         frozenset({'session:create', 'session:read'}), 'private-owner')
+    rpc = HostedRoomAuthorityRPC(authority, loop, room_id='duplicate', member_id='helper',
+                                 profile='beta', principal=actor, authorize=lambda *args: True)
+    arrived, release = threading.Event(), threading.Event()
+    lock = threading.Lock()
+    count = 0
+    real = run._load_gateway_config
+
+    def held_read(*args, **kwargs):
+        nonlocal count
+        with lock:
+            count += 1
+            if count == 2:
+                arrived.set()
+        if not release.wait(30):
+            raise TimeoutError('config test release')
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(run, '_load_gateway_config', held_read)
+    params = {'profile': 'beta', 'source': 'bot_room', 'title': 'Group: duplicate'}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(rpc.create, **params)
+        second = pool.submit(rpc.create, **params)
+        try:
+            assert arrived.wait(20), 'both creates did not reach config reader'
+        finally:
+            release.set()
+        assert first.result(timeout=30) == second.result(timeout=30)
+    assert authority.db.get_session(rpc.ref.session_id) is not None
