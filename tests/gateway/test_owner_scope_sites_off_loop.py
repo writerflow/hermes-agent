@@ -1172,7 +1172,7 @@ def _recovery_world(tmp_path, monkeypatch, names=("rec-a", "rec-b")):
             home, db=SimpleNamespace(_read_all=lambda sql: []), logical_owner=lambda sid: sid,
             recover_native_sessions=recover_native))
     runner = SimpleNamespace(session_authorities=SimpleNamespace(serving=lambda: list(authorities)),
-                             session_store=SimpleNamespace(list_sessions=lambda: []))
+                             session_store=SimpleNamespace(list_sessions=list))
 
     async def ensure(_runner):
         return None
