@@ -224,7 +224,7 @@ async def follow_detached_pin(runner, evt):
     if not key or not all_authorities(runner):
         return evt
     if (detached := detached_session_id(key)) is not None:
-        return _follow_detached_key(runner, evt, key, detached)
+        return await _follow_detached_key(runner, evt, key, detached)
     if not pinned:
         return evt
     store = runner.session_store
@@ -239,31 +239,31 @@ async def follow_detached_pin(runner, evt):
     row = authority.db.get_session(target)
     if row is None or row.get('ended_at'):
         return evt
-    live = _mounted(authority, session_id)
+    live = await _mounted(authority, session_id)
     if live is None or live.route != detached_key(key, session_id):
         return evt
     return {**evt, 'session_key': live.route}
 
 
-def _follow_detached_key(runner, evt, key, session_id):
+async def _follow_detached_key(runner, evt, key, session_id):
     """A result of a turn that ran on detached *key*: on the chat's route once the chat names the
     conversation again (its ``/resume``), as that conversation's own result there."""
     authority = _route_authority(runner, runner.session_store, key)
-    live = _mounted(authority, session_id) if authority is not None else None
+    live = await _mounted(authority, session_id) if authority is not None else None
     if live is None or live.route == key:
         return evt
     return {**evt, 'session_key': live.route}
 
 
-def _mounted(authority, session_id):
+async def _mounted(authority, session_id):
     """*session_id*'s live session, mounted as its route would after a restart (off the chat when the
     chat names another conversation); None when it cannot be mounted now."""
     if session_id not in authority.sessions:
-        from gateway.session_authorities import owner_scope
+        from gateway.session_authorities import async_owner_scope
         from gateway.session_route_recovery import restore_routed_session
         from hermes_state_runtime import RuntimeStoreError
         try:
-            with owner_scope(authority):
+            async with async_owner_scope(authority):
                 restore_routed_session(authority, session_id)
         except RuntimeStoreError:  # draining: the drain retries it
             return None

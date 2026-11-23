@@ -22,7 +22,8 @@ def test_managed_worker_turn_survives_lease_refresh_tick(tmp_path):
         before = lease._authority_deadline
         assert lease.refresh_tick() is None
         assert interrupts == [] and lease.interrupt_message is None
-        assert sent == [('worker.persist', 'turn.renew', {'holder': 'holder', 'ttl_seconds': LEASE_TTL_SECONDS})]
+        assert sent == [('worker.persist', 'turn.renew', {'holder': 'holder', 'ttl_seconds': RuntimeSessionStore.turn_lease_ttl_seconds})]
+        assert RuntimeSessionStore.turn_lease_ttl_seconds > LEASE_TTL_SECONDS
         assert lease._authority_deadline >= before
     finally:
         store.close()

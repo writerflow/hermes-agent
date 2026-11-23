@@ -184,12 +184,14 @@ def test_startup_replay_uses_stricter_budget(tmp_path, monkeypatch):
     assert rpc.calls == 1
 
 
-def test_owner_silence_budget_matches_kanban_wait_budget(tmp_path, monkeypatch):
+def test_owner_wait_covers_the_persist_budget_plus_one_attempt(tmp_path, monkeypatch):
+    """The Kanban submitter is the second clock: if it gave up first, ``_watch_submitter`` would end a
+    turn whose persist retry is still inside its budget."""
     home = tmp_path / ".hermes"
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setenv("HOME", str(tmp_path))
-    from agent.runtime_session_store import OWNER_SILENCE_BUDGET_S
+    from agent.runtime_session_store import OWNER_SILENCE_BUDGET_S, RECEIPT_ATTEMPT_TIMEOUT_S
     from pathlib import Path
     import sys
     import types
@@ -199,7 +201,51 @@ def test_owner_silence_budget_matches_kanban_wait_budget(tmp_path, monkeypatch):
     monkeypatch.setitem(sys.modules, "hermes_bootstrap", types.ModuleType("hermes_bootstrap"))
     from hermes_cli.kanban_worker_client import OWNER_WAIT_S
 
-    assert OWNER_SILENCE_BUDGET_S == OWNER_WAIT_S
+    assert OWNER_WAIT_S >= OWNER_SILENCE_BUDGET_S + RECEIPT_ATTEMPT_TIMEOUT_S
+
+
+def test_persist_rides_out_a_290_second_owner_silence(tmp_path, monkeypatch):
+    """Fake clock: every attempt costs the 20 s receipt timeout; the owner answers after 290 s."""
+    import agent.runtime_session_store as module
+
+    clock = [0.0]
+    monkeypatch.setattr(module, "_monotonic", lambda: clock[0])
+    monkeypatch.setattr(module, "_sleep_or_cancel", lambda cancel, delay: clock.__setitem__(0, clock[0] + delay) or False)
+
+    class RPC:
+        calls = 0
+
+        def __call__(self, method, **params):
+            self.calls += 1
+            clock[0] += module.RECEIPT_ATTEMPT_TIMEOUT_S
+            if clock[0] < 290.0:
+                raise TimeoutError("worker_receipt_timeout")
+            return {"value": "committed"}
+
+    rpc = RPC()
+    store = make_store(tmp_path, rpc)
+    assert store._apply("operation", {}) == {"value": "committed"}
+    assert store.failure is None
+    assert store.journal["pending"] == []
+    assert clock[0] >= 290.0
+
+
+def test_unanswered_owner_exhausts_within_the_budget_plus_one_attempt(tmp_path, monkeypatch):
+    import agent.runtime_session_store as module
+
+    clock = [0.0]
+    monkeypatch.setattr(module, "_monotonic", lambda: clock[0])
+    monkeypatch.setattr(module, "_sleep_or_cancel", lambda cancel, delay: clock.__setitem__(0, clock[0] + delay) or False)
+
+    def rpc(method, **params):
+        clock[0] += module.RECEIPT_ATTEMPT_TIMEOUT_S
+        raise TimeoutError("worker_receipt_timeout")
+
+    store = make_store(tmp_path, rpc)
+    with pytest.raises(TimeoutError):
+        store._apply("operation", {})
+    assert module.OWNER_SILENCE_BUDGET_S <= clock[0] <= module.OWNER_SILENCE_BUDGET_S + module.RECEIPT_ATTEMPT_TIMEOUT_S
+    assert store.journal["pending"]
 
 
 def test_cancelled_retry_preserves_pending_entry(tmp_path, monkeypatch):

@@ -31,6 +31,19 @@ _REFRESH_WRITE_PATIENCE_S = 20.0
 _REFRESH_EXPIRY_MARGIN_S = 2.0
 
 
+def _lease_ttl_seconds(db) -> float:
+    """The TTL ``db`` advertises on its class, else ``LEASE_TTL_SECONDS`` (read at call time).
+
+    The worker store (``RuntimeSessionStore``) advertises a longer one: its renewal queues behind the
+    persist retry on ``store.lock`` and ignores ``patience_s``, so it can block for the whole owner-silence
+    budget. The class is checked, not the instance, because MagicMock-style shims answer any attribute.
+    """
+    advertised = getattr(type(db), "turn_lease_ttl_seconds", None)
+    if isinstance(advertised, (int, float)) and not isinstance(advertised, bool) and advertised > 0:
+        return float(advertised)
+    return LEASE_TTL_SECONDS
+
+
 class DurableTurnLease:
     """An admitted session turn lease plus the periodic timers that keep it alive and watch the turn.
 
@@ -47,7 +60,8 @@ class DurableTurnLease:
         # Wall clock, same as the row's expires_at, never later than it: the row's committed expiry at
         # admission, then a timestamp taken BEFORE each successful renewal (the store stamps expiry
         # before its lock wait). Only a successful renewal moves it.
-        self._authority_deadline = time.time() + LEASE_TTL_SECONDS if expires_at is None else expires_at
+        self.ttl_seconds = _lease_ttl_seconds(db)
+        self._authority_deadline = time.time() + self.ttl_seconds if expires_at is None else expires_at
         self.stop = threading.Event()
         self.refresh_interval = float(getattr(agent, "_session_turn_lease_refresh_interval", 60.0))
         self._lock = threading.Lock()
@@ -218,15 +232,17 @@ class DurableTurnLease:
         # The whole renewal must finish before the authority runs out: a renewal still waiting on the
         # write lock past expiry keeps this turn running while a successor reclaims the row. The
         # margin covers one BEGIN IMMEDIATE that blocks in SQLite's busy handler past the patience.
+        # ``patience_s`` bounds only a SQLite writer wait. The worker store ignores it: its renewal can
+        # block for the whole persist budget plus one attempt, which ``ttl_seconds`` is sized to cover.
         patience = self._authority_deadline - _REFRESH_EXPIRY_MARGIN_S - started
         if patience <= 0:
             return self._stop_on_exhausted_authority()
         try:
             if self.db.refresh_session_turn_lease(
-                self._current_session_id(), self.holder, ttl_seconds=LEASE_TTL_SECONDS,
+                self._current_session_id(), self.holder, ttl_seconds=self.ttl_seconds,
                 patience_s=min(_REFRESH_WRITE_PATIENCE_S, patience),
             ):
-                self._authority_deadline = started + LEASE_TTL_SECONDS
+                self._authority_deadline = started + self.ttl_seconds
                 return None
             if self.stop.is_set():
                 return False
@@ -267,7 +283,7 @@ class TurnLeaseAdmission:
     conversation_history: Optional[list[dict[str, Any]]] = None
 
 
-def _committed_lease_expiry(db, session_id: str, holder: str, floor: float) -> float:
+def _committed_lease_expiry(db, session_id: str, holder: str, floor: float, ttl_seconds: float) -> float:
     """The admitted row's committed ``expires_at``; when unreadable, ``floor + TTL`` (taken before
     acquisition, so never later than the real expiry). Overstating it lets a successor reclaim the
     row while this turn still believes it holds the lease."""
@@ -279,7 +295,7 @@ def _committed_lease_expiry(db, session_id: str, holder: str, floor: float) -> f
                 return float(committed)
         except Exception:
             logger.debug("Could not read the admitted turn lease expiry; using the pre-acquire floor", exc_info=True)
-    return floor + LEASE_TTL_SECONDS
+    return floor + ttl_seconds
 
 
 def _durable_session_exists(db, session_id: str) -> Optional[bool]:
@@ -344,8 +360,9 @@ def admit_durable_turn_lease(
         )
 
     authority_floor = time.time()  # every acquisition attempt stamps its expiry after this instant
+    ttl_seconds = _lease_ttl_seconds(db)
     if not db.acquire_session_turn_lease(
-        session_id, holder, ttl_seconds=LEASE_TTL_SECONDS, wait_seconds=LEASE_WAIT_SECONDS,
+        session_id, holder, ttl_seconds=ttl_seconds, wait_seconds=LEASE_WAIT_SECONDS,
         on_wait=_on_wait, on_contended=_on_contended,
         should_abort=lambda: getattr(agent, "_interrupt_requested", False),
     ):
@@ -356,9 +373,11 @@ def admit_durable_turn_lease(
     # Assign only after admission so the finally cannot release a holder that never owned the
     # row; persist paths read the agent attr so a late flush is fenced in the same transaction.
     lease = DurableTurnLease(
-        agent, db, session_id, holder, expires_at=_committed_lease_expiry(db, session_id, holder, authority_floor),
+        agent, db, session_id, holder, expires_at=_committed_lease_expiry(db, session_id, holder, authority_floor, ttl_seconds),
     )
     agent._active_session_turn_lease_holder = holder
+    # Deliberately NOT ``ttl_seconds``: this attribute only restamps an expired row inside an append, and
+    # ``append_messages_batch`` reroutes any value but 300 to ``compression.append``, a different receipt kind.
     agent._active_session_turn_lease_ttl_seconds = LEASE_TTL_SECONDS
     try:
         # Read the row only now: the previous holder may have created or deleted it while this

@@ -1448,6 +1448,9 @@ def _run_foreground(
             # internal env.execute() consumers stay unbounded.
             result = env.execute(
                 command, timeout=effective_timeout, cwd=command_cwd, bounded_capture=True,
+                # Only the model's own foreground command gets a capped scope, and only a backend that says so
+                # receives the keyword (plugin backends and test doubles keep their old execute() signature).
+                **({"resource_scope": True} if metered and getattr(env, "supports_resource_scope", False) is True else {}),
                 **_yield_kwargs(command, env_type=env_type, cwd=command_cwd, effective_task_id=eff,
                                 task_id=task_id, session_key=session_key),
             )

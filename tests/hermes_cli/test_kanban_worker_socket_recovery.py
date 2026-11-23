@@ -194,7 +194,7 @@ async def test_connecting_is_not_an_answer(monkeypatch, _worker_env, clock):
     # budget, so this still ends at OWNER_WAIT_S instead of redialling forever.
     owner = _Owner(receipts=["pending"] + [_disconnect()] * 200)
 
-    with pytest.raises(gateway_client.GatewayClientError, match=r"owner silent for 1[89]\ds"):
+    with pytest.raises(gateway_client.GatewayClientError, match=r"owner silent for \d+s"):
         await _run(owner, monkeypatch, _worker_env)
     assert owner.calls.count("kanban.run") == 1
 
@@ -210,11 +210,25 @@ async def test_an_owner_silent_for_the_whole_budget_fails_the_worker(monkeypatch
     # Every restart shape still ends at OWNER_WAIT_S when it never clears.
     owner = _Owner(connects=[None], receipts=["pending", _disconnect()], after=fault)
 
-    with pytest.raises(gateway_client.GatewayClientError, match=rf"owner silent for 1[89]\ds: {fault}"):
+    with pytest.raises(gateway_client.GatewayClientError, match=rf"owner silent for \d+s: {fault}"):
         await _run(owner, monkeypatch, _worker_env)
     assert clock.now >= kanban_worker_client.OWNER_WAIT_S
-    # Jittered exponential backoff (capped at 8-16 s) between dials, not one dial a second.
-    assert 3 < owner.dials < 40 and owner.calls.count("kanban.run") == 1
+    # Jittered exponential backoff (capped at 8-16 s) between dials, not one dial every few seconds.
+    assert 3 < owner.dials < 80 and owner.calls.count("kanban.run") == 1
+
+
+@pytest.mark.asyncio
+async def test_an_owner_silent_for_290s_then_back_keeps_the_worker(monkeypatch, _worker_env, clock):
+    """A stall that ends without a restart must not end the worker at the old 180 s wait: the owner is
+    refused for 290 s of fake time, comes back, and the same attempt finishes (kanban.run sent once)."""
+    def refused_until_290():
+        return ConnectionRefusedError(61, "refused") if clock.now < 290 else None
+
+    owner = _Owner(connects=[None], receipts=["pending", _disconnect()], after=refused_until_290)
+
+    assert await _run(owner, monkeypatch, _worker_env) == 0
+    assert clock.now >= 290
+    assert owner.calls.count("kanban.run") == 1
 
 
 @pytest.mark.asyncio

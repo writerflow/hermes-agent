@@ -404,6 +404,22 @@ real_home = Path(os.environ.get("HERMES_REAL_HOME", os.environ["HOME"]))
 The agent has the same filesystem access as your user account. Use `hermes tools` to disable tools you don't want, or switch to Docker for sandboxing.
 :::
 
+### Foreground Command Scopes (Linux, systemd)
+
+A managed worker (or the supervised gateway) runs the agent's foreground commands as children of a process that sits in the gateway's cgroup, so a systemd limit can never reach a build's fan-out (`./gradlew test`, `vitest`, `npm ci`). With this switch on, each foreground terminal command starts in its own transient user scope named `hermes-worker-fg-<task>-<id>.scope`, which carries only memory accounting. The limits (`CPUQuota`, `CPUWeight`, `TasksMax`, `MemoryHigh`, `MemorySwapMax`) come from a systemd drop-in you own, `~/.config/systemd/user/hermes-worker-fg-.scope.d/*.conf`, so you tune them without a release. Hermes sets no `MemoryMax`: a runaway scope is throttled, not killed, until the command's timeout.
+
+```yaml
+terminal:
+  foreground_scope:
+    enabled: false          # default; read per command, no restart needed to change it
+    gradle_daemon: per_command   # or "shared"
+```
+
+- It applies only to the terminal tool's foreground commands on the local backend, inside a managed worker or the live supervised gateway. A `hermes` CLI, a CLI started inside a build, macOS, Windows, and hosts with no `systemd-run --user` or user bus run exactly as before (one warning per process when the switch is on but systemd is unusable).
+- `gradle_daemon: per_command` gives each scoped command its own single-use Gradle daemon (`GRADLE_OPTS` gets `-Dorg.gradle.daemon=false` unless you already set `org.gradle.daemon`), so a build's java is charged to that command; it costs about 9 seconds per Gradle run over a warm shared daemon. `shared` leaves `GRADLE_OPTS` alone.
+- At `TasksMax` a process cannot fork (`Resource temporarily unavailable`); the tool appends a one-line note naming the limit and this switch.
+- Background commands and `process` sessions are not scoped by this switch.
+
 ### Docker Backend
 
 Runs commands inside a Docker container with security hardening (all capabilities dropped, no privilege escalation, PID limits).

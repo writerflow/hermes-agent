@@ -19,7 +19,7 @@ def setup_store(tmp_path):
     return db, store, scope
 
 
-def test_reserved_constructor_backfill_and_end_are_receipted(tmp_path):
+def test_reserved_constructor_backfill_and_end_are_receipted(tmp_path, monkeypatch):
     db, store, scope = setup_store(tmp_path)
     try:
         assert store.create_session('owned', 'cli', model='requested', system_prompt='prefix',
@@ -43,6 +43,8 @@ def test_reserved_constructor_backfill_and_end_are_receipted(tmp_path):
                                         operation='session.create', payload=payload)
         store.append_messages_batch('owned', [{'role': 'assistant', 'content': 'done', 'finish_reason': 'stop'}])
         assert store.session_lifecycle_statuses(['owned']) == db.session_lifecycle_statuses(['owned'])
+        # A lost ack is retried for the owner-silence budget; this test is about the pending receipt, not the wait.
+        monkeypatch.setattr('agent.runtime_session_store.OWNER_SILENCE_BUDGET_S', 0.0)
         original = store.rpc
         def lost_ack(method, **params):
             original(method, **params)
