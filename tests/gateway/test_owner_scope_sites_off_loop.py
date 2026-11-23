@@ -978,3 +978,101 @@ async def test_site_ws_serve_drain_during_the_hop_refuses_with_1013_and_never_ca
     assert handled == []
     assert sent[-1] == {"type": "websocket.close", "code": 1013, "reason": ""}
     assert _bound()["home"] != str(home)
+
+
+# --- Site 3: serve_profile_runtime (run_runtime.py), one scope per profile served ---------------------
+
+class _ServeRegistry:
+    def __init__(self):
+        self.removed = []
+
+    def for_home(self, home):
+        return None
+
+    def remove(self, home):
+        self.removed.append(Path(home).resolve())
+
+
+def _serve_world(tmp_path, monkeypatch):
+    """A real ``serve_profile_runtime`` over a routed home; every recovery step records its binding."""
+    from gateway import run_runtime
+    from gateway import session_hosted_service
+    from gateway.platforms import webhook_ingress
+    from gateway import session_local_recovery
+
+    home = _make_home(tmp_path, "served").resolve()
+    authority = _authority(home)
+    registry = _ServeRegistry()
+    runner = SimpleNamespace(session_authorities=registry, session_control_server=None)
+    steps, retired = [], []
+
+    def record(step):
+        steps.append((step, threading.get_ident(), _bound()))
+
+    async def build(*args, **kwargs):
+        return authority
+
+    async def retire(auth, timeout=None):
+        retired.append(auth)
+        return True
+
+    async def mailbox(auth):
+        record("bot_mailbox")
+
+    async def webhook(auth):
+        record("webhook")
+
+    monkeypatch.setattr(run_runtime, "_build_profile_authority", build)
+    monkeypatch.setattr(run_runtime, "_retire_profile_authority", retire)
+    monkeypatch.setattr(run_runtime, "_publish_served_set", lambda r: None)
+    monkeypatch.setattr(run_runtime, "_drop_retired_local_adapter", lambda a: record("drop_adapter"))
+    monkeypatch.setattr(run_runtime, "recover_bot_mailbox", mailbox)
+    monkeypatch.setattr(run_runtime, "_recover_published_api_turns", lambda r, a: record("api_turns"))
+    monkeypatch.setattr(session_local_recovery, "recover_local_sessions", lambda a, schedule: record("local_sessions"))
+    monkeypatch.setattr(webhook_ingress, "recover_webhook_finalizations", webhook)
+    monkeypatch.setattr(session_hosted_service, "start_ready_hosted_services", lambda r: None)
+    return home, authority, runner, registry, steps, retired
+
+
+_SERVE_ORDER = ["drop_adapter", "bot_mailbox", "local_sessions", "webhook", "api_turns"]
+
+
+@pytest.mark.asyncio
+async def test_site_serve_profile_runtime_reads_the_profile_off_the_loop(tmp_path, reads, n0, monkeypatch):
+    from gateway import run_runtime
+    home, authority, runner, _registry, steps, _retired = _serve_world(tmp_path, monkeypatch)
+    expected = _expected_scope(authority)
+    reads.reads.clear()
+    assert await run_runtime.serve_profile_runtime(runner, "served", home) is authority
+    _assert_reach(reads, home, n0)
+    _assert_off_loop(reads, home, threading.get_ident())
+    assert [s for s, _t, _b in steps] == _SERVE_ORDER
+    assert all(b == expected and t == threading.get_ident() for _s, t, b in steps)
+
+
+@pytest.mark.asyncio
+async def test_site_serve_profile_runtime_a_failing_prepare_retires_the_authority(tmp_path, reads, n0, monkeypatch):
+    from gateway import run_runtime, session_authorities
+    home, authority, runner, registry, steps, retired = _serve_world(tmp_path, monkeypatch)
+
+    async def unreadable(auth):
+        raise OSError("profile unreadable")
+
+    monkeypatch.setattr(session_authorities, "prepare_owner_scope", unreadable)
+    with pytest.raises(OSError, match="profile unreadable"):
+        await run_runtime.serve_profile_runtime(runner, "served", home)
+    assert retired == [authority] and registry.removed == [home] and steps == []
+
+
+@pytest.mark.asyncio
+async def test_site_serve_profile_runtime_cancel_during_prepare_retires_the_authority(tmp_path, reads, n0, monkeypatch):
+    from gateway import run_runtime
+    home, authority, runner, registry, steps, retired = _serve_world(tmp_path, monkeypatch)
+    gate = _HopGate(monkeypatch)
+    task = asyncio.create_task(run_runtime.serve_profile_runtime(runner, "served", home))
+    await gate.wait_entered()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    gate.release.set()
+    assert retired == [authority] and registry.removed == [home] and steps == []
