@@ -83,7 +83,7 @@ class HostedRoomAuthorityRPC:
         from gateway.session_policy import build_policy
         from gateway.session_local import stage_local_session
         from gateway.session_local_recovery import restore_local_session
-        from gateway.session_runtime_workers import tracked_write
+        from gateway.session_runtime_workers import track_mutation, tracked_write
         from hermes_state_local import commit_local_session
         from agent.skill_utils import parse_config_string_list
         authority = self.authority
@@ -102,7 +102,8 @@ class HostedRoomAuthorityRPC:
                              toolsets=tuple(sorted(set(policy.toolsets) | {'bot_room'})))
             return policy, private
 
-        policy, private = await asyncio.to_thread(prepare)
+        read_task = track_mutation(authority, asyncio.to_thread(prepare))
+        policy, private = await asyncio.shield(read_task)
         registry = getattr(authority.runner, 'session_authorities', None)
         if (self.authority is not authority or authority.db is not db or authority.epoch != epoch
                 or authority.retiring or authority.runner._draining

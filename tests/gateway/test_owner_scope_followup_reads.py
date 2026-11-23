@@ -2,9 +2,9 @@
 import asyncio
 import concurrent.futures
 import threading
+from pathlib import Path
 
 import pytest
-from pathlib import Path
 
 from tests.gateway.test_hosted_mux_runtime import mux  # noqa: F401
 
