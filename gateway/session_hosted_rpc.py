@@ -86,18 +86,32 @@ class HostedRoomAuthorityRPC:
         from gateway.session_runtime_workers import tracked_write
         from hermes_state_local import commit_local_session
         from agent.skill_utils import parse_config_string_list
-        private = {}
-        config = _load_gateway_config()
-        # A room has no clarification reply (group controls expose approvals only), so a member
-        # turn that called clarify would block for clarify_timeout with its question unseen. As
-        # for cron, freeze it out; the member asks its question in the room reply instead.
-        agent = dict(config.get('agent') or {})
-        agent['disabled_toolsets'] = sorted(
-            set(parse_config_string_list(agent.get('disabled_toolsets'))) | {'clarify'})
-        policy = build_policy({'source': 'gui'}, {**config, 'agent': agent}, private_secrets=private)
-        policy = replace(policy, source='bot_room', platform='bot_room',
-                         model=policy.model or _resolve_gateway_model(policy.config()),
-                         toolsets=tuple(sorted(set(policy.toolsets) | {'bot_room'})))
+        authority = self.authority
+        db, epoch = authority.db, authority.epoch
+
+        def prepare():
+            private = {}
+            config = _load_gateway_config()
+            # Hosted rooms have no clarification reply surface.
+            agent = dict(config.get('agent') or {})
+            agent['disabled_toolsets'] = sorted(
+                set(parse_config_string_list(agent.get('disabled_toolsets'))) | {'clarify'})
+            policy = build_policy({'source': 'gui'}, {**config, 'agent': agent}, private_secrets=private)
+            policy = replace(policy, source='bot_room', platform='bot_room',
+                             model=policy.model or _resolve_gateway_model(policy.config()),
+                             toolsets=tuple(sorted(set(policy.toolsets) | {'bot_room'})))
+            return policy, private
+
+        policy, private = await asyncio.to_thread(prepare)
+        registry = getattr(authority.runner, 'session_authorities', None)
+        if (self.authority is not authority or authority.db is not db or authority.epoch != epoch
+                or authority.retiring or authority.runner._draining
+                or (registry is not None and registry.for_home(authority.profile_id) is not authority)):
+            raise RuntimeStoreError('runtime_draining')
+        if self.authorizer('create', None, None) is not True:
+            raise RuntimeStoreError('permission_denied')
+        if db.get_session(self.ref.session_id) is not None:
+            return await self._resume(params)
         staged = stage_local_session(self.authority, self.principal, {'request_id': self.creation_id},
                                      trusted_policy=policy, trusted_secrets=private)
         # Creation commit and label run off the owner loop (N90); a concurrent duplicate converges.

@@ -1,4 +1,5 @@
 """Read-location regressions for hosted, cron and recovery owner scopes."""
+import asyncio
 import concurrent.futures
 import threading
 
@@ -72,4 +73,51 @@ def test_hosted_create_rechecks_membership_after_config(mux, monkeypatch):
             release.set()
         with pytest.raises(RuntimeStoreError, match='permission_denied'):
             future.result(timeout=30)
+    assert authority.db.get_session(rpc.ref.session_id) is None
+
+
+def test_hosted_cancel_retains_physical_reader_until_settled(mux, monkeypatch):
+    from gateway import run
+    from gateway.session_contract import SessionActor
+    from gateway.session_hosted_rpc import HostedRoomAuthorityRPC
+    from gateway.session_runtime_workers import mutation_tasks
+
+    runner, homes, loop, call = mux
+    authority = runner.session_authorities.require(homes['beta'])
+    actor = SessionActor('alice', authority.profile_id,
+                         frozenset({'session:create', 'session:read'}), 'private-owner')
+    rpc = HostedRoomAuthorityRPC(authority, loop, room_id='cancel', member_id='helper',
+                                 profile='beta', principal=actor, authorize=lambda *args: True)
+    entered, release, finished = threading.Event(), threading.Event(), threading.Event()
+    real = run._load_gateway_config
+
+    def held_read(*args, **kwargs):
+        entered.set()
+        try:
+            if not release.wait(30):
+                raise TimeoutError('config test release')
+            return real(*args, **kwargs)
+        finally:
+            finished.set()
+
+    async def begin():
+        return asyncio.create_task(rpc._dispatch('create', {
+            'profile': 'beta', 'source': 'bot_room', 'title': 'Group: cancel'}))
+
+    async def cancel_and_count(task):
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        return len(mutation_tasks(authority))
+
+    monkeypatch.setattr(run, '_load_gateway_config', held_read)
+    task = call(begin())
+    try:
+        assert entered.wait(20), 'hosted create did not reach config reader'
+        assert call(cancel_and_count(task)) >= 1, 'retirement lost the physical read'
+    finally:
+        release.set()
+        assert finished.wait(30)
     assert authority.db.get_session(rpc.ref.session_id) is None
