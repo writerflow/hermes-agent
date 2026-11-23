@@ -127,6 +127,54 @@ def test_hosted_cancel_retains_physical_reader_until_settled(mux, monkeypatch):
     assert authority.db.get_session(rpc.ref.session_id) is None
 
 
+def test_hosted_cancel_consumes_late_read_error(mux, monkeypatch):
+    from gateway import run
+    from gateway.session_contract import SessionActor
+    from gateway.session_hosted_rpc import HostedRoomAuthorityRPC
+    from gateway.session_runtime_workers import mutation_tasks
+
+    runner, homes, loop, call = mux
+    authority = runner.session_authorities.require(homes['beta'])
+    actor = SessionActor('alice', authority.profile_id,
+                         frozenset({'session:create', 'session:read'}), 'private-owner')
+    rpc = HostedRoomAuthorityRPC(authority, loop, room_id='late-error', member_id='helper',
+                                 profile='beta', principal=actor, authorize=lambda *args: True)
+    entered, release = threading.Event(), threading.Event()
+
+    def failing_read(*args, **kwargs):
+        entered.set()
+        if not release.wait(30):
+            raise TimeoutError('config test release')
+        raise ValueError('late synthetic read failure')
+
+    async def begin():
+        return asyncio.create_task(rpc._dispatch('create', {
+            'profile': 'beta', 'source': 'bot_room', 'title': 'Group: late-error'}))
+
+    async def cancel_and_capture(task):
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        tasks = mutation_tasks(authority)
+        assert tasks, 'retirement lost the physical reader'
+        return tasks
+
+    async def settle(tasks):
+        return await asyncio.gather(*tasks, return_exceptions=True)
+
+    monkeypatch.setattr(run, '_load_gateway_config', failing_read)
+    task = call(begin())
+    try:
+        assert entered.wait(20), 'hosted create did not reach config reader'
+        tasks = call(cancel_and_capture(task))
+    finally:
+        release.set()
+    results = call(settle(tasks))
+    assert any(isinstance(value, ValueError) and str(value) == 'late synthetic read failure'
+               for value in results)
+    assert authority.db.get_session(rpc.ref.session_id) is None
+
+
 def test_hosted_exact_retry_avoids_broken_config(mux, monkeypatch):
     from gateway import run
     from gateway.session_contract import SessionActor
