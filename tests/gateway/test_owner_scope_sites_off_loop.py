@@ -1283,3 +1283,80 @@ async def test_site_cron_local_delivery_looks_the_chat_up_only_after_the_hop(tmp
         session_cron.unbind_owner(authority)
     assert sessions.gets == ["gone"]
     assert message is not None and "KeyError" in message  # an unknown chat still surfaces as before
+
+
+# --- Site 8: cron operation ``submit`` (session_cron.py), one scope per cron submit -------------------
+
+def _submit_world(tmp_path, monkeypatch):
+    """The real ``operation(authority, 'submit', ...)`` with the real admission check; ``_create`` records."""
+    import types
+    from gateway import session_cron, session_runtime_workers
+    from gateway.session_authority import SessionAuthority
+    from gateway.session_contract import SessionRef
+    home = _make_home(tmp_path, "submit").resolve()
+    authority = _authority(home, db=SimpleNamespace(), epoch=1, retiring=False, retired=False)
+    authority.runner._draining = False
+    authority._require_admission_open = types.MethodType(SessionAuthority._require_admission_open, authority)
+    authority._admission_gate = lambda *a, **k: None
+    authority._admitted = lambda *a, **k: None
+    authority._schedule_admitted = lambda *a, **k: None
+    created = []
+
+    def create(auth, actor, params):
+        created.append((threading.get_ident(), _bound()))
+        return SessionRef(authority.profile_id, "sid1"), "req1"
+
+    async def tracked_write(auth, write, then=None, *, ordered=False, after=None):
+        return SimpleNamespace(admission_id="adm1")
+
+    monkeypatch.setattr(session_cron, "_create", create)
+    monkeypatch.setattr(session_runtime_workers, "tracked_write", tracked_write)
+    params = {"job_id": "job1", "request_id": "exec1", "extra_prompt": None}
+    return home, authority, created, params, session_cron
+
+
+@pytest.mark.asyncio
+async def test_site_cron_submit_reads_the_profile_off_the_loop(tmp_path, reads, n0, monkeypatch):
+    home, authority, created, params, session_cron = _submit_world(tmp_path, monkeypatch)
+    expected = _expected_scope(authority)
+    reads.reads.clear()
+    result = await session_cron.operation(authority, "submit", params)
+    assert result == {"session_id": "sid1", "admission_id": "adm1"}
+    _assert_reach(reads, home, n0)
+    _assert_off_loop(reads, home, threading.get_ident())
+    assert created == [(threading.get_ident(), expected)]  # create still runs on the loop, under the owner
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("how", ["retiring", "runner_draining"])
+async def test_site_cron_submit_a_drain_during_the_hop_is_refused_and_creates_nothing(tmp_path, reads, n0, monkeypatch, how):
+    from hermes_state_runtime import RuntimeStoreError
+    _home, authority, created, params, session_cron = _submit_world(tmp_path, monkeypatch)
+    gate = _HopGate(monkeypatch)
+    task = asyncio.create_task(session_cron.operation(authority, "submit", params))
+    await gate.wait_entered()
+    if how == "retiring":
+        authority.retiring = True
+    else:
+        authority.runner._draining = True  # the drain begins while the profile read is in flight
+    gate.release.set()
+    with pytest.raises(RuntimeStoreError) as raised:
+        await task
+    assert raised.value.reason == "runtime_draining"
+    assert created == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("how", ["retiring", "runner_draining"])
+async def test_site_cron_submit_an_already_draining_authority_is_refused_before_any_file_read(tmp_path, reads, n0, monkeypatch, how):
+    from hermes_state_runtime import RuntimeStoreError
+    home, authority, created, params, session_cron = _submit_world(tmp_path, monkeypatch)
+    reads.reads.clear()
+    if how == "retiring":
+        authority.retiring = True
+    else:
+        authority.runner._draining = True
+    with pytest.raises(RuntimeStoreError) as raised:
+        await session_cron.operation(authority, "submit", params)
+    assert raised.value.reason == "runtime_draining"
+    assert created == [] and reads.reads_for(home) == []
