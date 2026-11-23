@@ -1151,3 +1151,67 @@ async def test_site_bot_mailbox_recovery_a_failing_prepare_aborts_the_launch_pro
     with pytest.raises(OSError, match="profile unreadable"):
         await run_runtime._recover_profile_bot_mailbox(runner, authority)
     assert recovered == [] and retired == [] and parked == []
+
+
+# --- Sites 5 and 6: native-session recovery (run_runtime.py) -----------------------------------------
+# Site 5 (``recover_gateway_native_sessions``) enters one scope per authority and then calls site 6
+# (``recover_profile_native_sessions``), which enters its own: each home sees two scope entries.
+
+def _recovery_world(tmp_path, monkeypatch, names=("rec-a", "rec-b")):
+    from gateway import session_detached, session_hosted_service, session_local_recovery
+    from gateway.platforms import webhook_ingress
+    homes = [_make_home(tmp_path, name).resolve() for name in names]
+    steps, native = [], []
+    authorities = []
+    for home in homes:
+        async def recover_native(bindings, _home=home):
+            native.append((str(_home), threading.get_ident(), _bound()))
+            return {}
+
+        authorities.append(_authority(
+            home, db=SimpleNamespace(_read_all=lambda sql: []), logical_owner=lambda sid: sid,
+            recover_native_sessions=recover_native))
+    runner = SimpleNamespace(session_authorities=SimpleNamespace(serving=lambda: list(authorities)),
+                             session_store=SimpleNamespace(list_sessions=lambda: []))
+
+    async def ensure(_runner):
+        return None
+
+    async def webhook(auth):
+        steps.append(("webhook", auth.profile_id, _bound()["home"]))
+
+    monkeypatch.setattr(session_hosted_service, "ensure_hosted_service", ensure)
+    monkeypatch.setattr(session_local_recovery, "recover_local_sessions",
+                        lambda auth, schedule: steps.append(("local", auth.profile_id, _bound()["home"])))
+    monkeypatch.setattr(webhook_ingress, "recover_webhook_finalizations", webhook)
+    monkeypatch.setattr(session_detached, "recover_detached_sessions", lambda auth, pending: [])
+    return homes, authorities, runner, steps, native
+
+
+@pytest.mark.asyncio
+async def test_site_recover_profile_native_sessions_reads_the_profile_off_the_loop(tmp_path, reads, n0, monkeypatch):
+    from gateway import run_runtime
+    homes, authorities, runner, _steps, native = _recovery_world(tmp_path, monkeypatch, names=("rec-a",))
+    expected = _expected_scope(authorities[0])
+    reads.reads.clear()
+    assert await run_runtime.recover_profile_native_sessions(runner, authorities[0]) == {}
+    _assert_reach(reads, homes[0], n0)
+    _assert_off_loop(reads, homes[0], threading.get_ident())
+    assert native == [(str(homes[0]), threading.get_ident(), expected)]
+
+
+@pytest.mark.asyncio
+async def test_site_recover_gateway_native_sessions_reads_each_profile_off_the_loop(tmp_path, reads, n0, monkeypatch):
+    from gateway import run_runtime
+    homes, authorities, runner, steps, native = _recovery_world(tmp_path, monkeypatch)
+    expected = {a.profile_id: _expected_scope(a) for a in authorities}
+    reads.reads.clear()
+    assert await run_runtime.recover_gateway_native_sessions(runner) == {}
+    loop_ident = threading.get_ident()
+    for home in homes:
+        # Two entries per home: site 5's own, then site 6's (``recover_profile_native_sessions`` is not stubbed).
+        _assert_reach(reads, home, 2 * n0)
+        _assert_off_loop(reads, home, loop_ident)
+    # Per-authority isolation and order: each home's steps ran under that home's binding.
+    assert steps == [(step, str(home), str(home)) for home in homes for step in ("local", "webhook")]
+    assert [(h, b) for h, _t, b in native] == [(str(home), expected[str(home)]) for home in homes]
