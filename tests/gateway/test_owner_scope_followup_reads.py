@@ -146,3 +146,40 @@ def test_hosted_exact_retry_avoids_broken_config(mux, monkeypatch):
 
     monkeypatch.setattr(run, '_load_gateway_config', broken)
     assert rpc.create(**params) == created
+
+
+def test_hosted_create_refuses_retirement_during_config(mux, monkeypatch):
+    from gateway import run
+    from gateway.session_contract import SessionActor
+    from gateway.session_hosted_rpc import HostedRoomAuthorityRPC
+    from hermes_state_runtime import RuntimeStoreError
+
+    runner, homes, loop, _ = mux
+    authority = runner.session_authorities.require(homes['beta'])
+    actor = SessionActor('alice', authority.profile_id,
+                         frozenset({'session:create', 'session:read'}), 'private-owner')
+    rpc = HostedRoomAuthorityRPC(authority, loop, room_id='retire', member_id='helper',
+                                 profile='beta', principal=actor, authorize=lambda *args: True)
+    entered, release = threading.Event(), threading.Event()
+    real = run._load_gateway_config
+
+    def held_read(*args, **kwargs):
+        entered.set()
+        if not release.wait(30):
+            raise TimeoutError('config test release')
+        return real(*args, **kwargs)
+
+    async def retire():
+        authority.retiring = True
+
+    monkeypatch.setattr(run, '_load_gateway_config', held_read)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(rpc.create, profile='beta', source='bot_room', title='Group: retire')
+        try:
+            assert entered.wait(20), 'hosted create did not reach config reader'
+            asyncio.run_coroutine_threadsafe(retire(), loop).result(15)
+        finally:
+            release.set()
+        with pytest.raises(RuntimeStoreError, match='runtime_draining'):
+            future.result(timeout=30)
+    assert authority.db.get_session(rpc.ref.session_id) is None
