@@ -194,9 +194,13 @@ async def operation(authority, name, params, actor=None):
         return state
     if name == 'submit':
         authority._require_admission_open()
-        from gateway.session_authorities import owner_scope
-        # The job id, jobs file and gateway config belong to the OWNING profile.
-        with owner_scope(authority):
+        from gateway.session_authorities import bind_prepared_owner_scope, prepare_owner_scope
+        # The job id, jobs file and gateway config belong to the OWNING profile. The profile read runs in
+        # a worker, so admission is checked again after it: a drain that began during the read must still
+        # refuse, and nothing suspends between that check and the creation below.
+        prepared = await prepare_owner_scope(authority)
+        authority._require_admission_open()
+        with bind_prepared_owner_scope(authority, prepared):
             ref, request_id = _create(authority, actor, params)
         from functools import partial
         from gateway.session_runtime_workers import tracked_write
