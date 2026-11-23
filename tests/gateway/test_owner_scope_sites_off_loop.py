@@ -1215,3 +1215,71 @@ async def test_site_recover_gateway_native_sessions_reads_each_profile_off_the_l
     # Per-authority isolation and order: each home's steps ran under that home's binding.
     assert steps == [(step, str(home), str(home)) for home in homes for step in ("local", "webhook")]
     assert [(h, b) for h, _t, b in native] == [(str(home), expected[str(home)]) for home in homes]
+
+
+# --- Site 7: _admit_local_delivery (session_cron.py), one scope per cron delivery to a local chat -----
+
+class _RecordingSessions(dict):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.gets = []
+
+    def get(self, key, default=None):
+        self.gets.append(key)
+        return super().get(key, default)
+
+
+def _delivery_world(tmp_path, monkeypatch, *, known=True):
+    from gateway import session_automation, session_cron, session_local_recovery, session_route_recovery
+    from gateway.config import Platform
+    home = _make_home(tmp_path, "delivery").resolve()
+    source = SimpleNamespace(platform=Platform.TELEGRAM)
+    live = SimpleNamespace(source=source)
+    sessions = _RecordingSessions({"chat1": live} if known else {})
+    adapter = object()
+    authority = _authority(home, sessions=sessions, db=SimpleNamespace(db_path=home / "state.db"))
+    authority.runner._adapter_for_source = lambda src: adapter
+    admitted = []
+
+    async def admit_route_wake(runner, adp, src, text, kind, metadata):
+        admitted.append((threading.get_ident(), _bound(), adp is adapter, text, kind))
+        return True
+
+    def restore_local_session(auth, chat_id):
+        raise KeyError(chat_id)
+
+    monkeypatch.setattr(session_automation, "admit_route_wake", admit_route_wake)
+    monkeypatch.setattr(session_local_recovery, "restore_local_session", restore_local_session)
+    monkeypatch.setattr(session_route_recovery, "mountable", lambda auth, chat_id: False)
+    session_cron.bind_owner(authority)
+    return home, authority, sessions, admitted, session_cron
+
+
+@pytest.mark.asyncio
+async def test_site_cron_local_delivery_reads_the_profile_off_the_loop(tmp_path, reads, n0, monkeypatch):
+    home, authority, _sessions, admitted, session_cron = _delivery_world(tmp_path, monkeypatch)
+    try:
+        expected = _expected_scope(authority)
+        reads.reads.clear()
+        assert await asyncio.to_thread(session_cron.deliver_to_local_chat, home, "chat1", "fire") is None
+    finally:
+        session_cron.unbind_owner(authority)
+    _assert_reach(reads, home, n0)
+    _assert_off_loop(reads, home, threading.get_ident())
+    assert admitted == [(threading.get_ident(), expected, True, "fire", "cron")]
+
+
+@pytest.mark.asyncio
+async def test_site_cron_local_delivery_looks_the_chat_up_only_after_the_hop(tmp_path, reads, n0, monkeypatch):
+    home, authority, sessions, _admitted, session_cron = _delivery_world(tmp_path, monkeypatch, known=False)
+    try:
+        gate = _HopGate(monkeypatch)
+        call = asyncio.create_task(asyncio.to_thread(session_cron.deliver_to_local_chat, home, "gone", "fire"))
+        await gate.wait_entered()
+        assert sessions.gets == []  # nothing read from the authority while the profile read is in flight
+        gate.release.set()
+        message = await call
+    finally:
+        session_cron.unbind_owner(authority)
+    assert sessions.gets == ["gone"]
+    assert message is not None and "KeyError" in message  # an unknown chat still surfaces as before
