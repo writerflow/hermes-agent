@@ -15,7 +15,7 @@ def test_cron_create_job_read_is_off_loop(mux, monkeypatch):
 
     runner, homes, loop, call = mux
     authority = runner.session_authorities.require(homes['beta'])
-    with jobs.use_cron_store(homes['beta'] / 'cron'):
+    with jobs.use_cron_store(homes['beta']):
         job = jobs.create_job(prompt='report', schedule='every 1h', deliver='local', model='fixture')
     observed = []
     real = jobs.get_job
