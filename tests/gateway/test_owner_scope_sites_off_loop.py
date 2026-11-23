@@ -763,14 +763,29 @@ class _HopGate:
     def __init__(self, monkeypatch):
         from gateway import session_authorities
         self.entered, self.release = threading.Event(), threading.Event()
+        self.finished = threading.Event()
         real = session_authorities._prepare_owner_scope
 
         def gated(home):
             self.entered.set()
             assert self.release.wait(10), "hop gate never released"
-            return real(home)
+            try:
+                return real(home)
+            finally:
+                self.finished.set()
 
         monkeypatch.setattr(session_authorities, "_prepare_owner_scope", gated)
+
+    async def wait_finished(self):
+        """The worker's profile read is done; let the loop run what that completion scheduled."""
+        for _ in range(500):
+            if self.finished.is_set():
+                break
+            await asyncio.sleep(0.01)
+        else:
+            pytest.fail("the worker-thread profile read never finished")
+        for _ in range(5):
+            await asyncio.sleep(0)
 
     async def wait_entered(self):
         for _ in range(500):
@@ -832,11 +847,7 @@ async def test_site_hosted_rpc_timeout_during_the_hop_never_cancels_the_dispatch
         await call
     assert owned == []  # still inside the hop
     gate.release.set()
-    for _ in range(500):
-        if owned:
-            break
-        await asyncio.sleep(0.01)
-    await asyncio.sleep(0.05)
+    await gate.wait_finished()
     assert [b for _o, _t, b in owned] == [expected], "the timed-out dispatch must still complete once, under the owner"
     _assert_off_loop(reads, home, threading.get_ident())
 
@@ -852,7 +863,7 @@ async def test_site_hosted_rpc_task_cancellation_during_the_hop_runs_nothing(tmp
     with pytest.raises(asyncio.CancelledError):
         await task
     gate.release.set()
-    await asyncio.sleep(0.1)
+    await gate.wait_finished()
     assert owned == [] and _bound() == before
     assert reads.on_loop(home, threading.get_ident()) == []
 
