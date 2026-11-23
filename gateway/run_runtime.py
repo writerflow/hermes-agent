@@ -452,7 +452,7 @@ async def serve_profile_runtime(runner, name, home):
     publish it in the descriptor/ticket store — the steps boot performs per secondary. Raises when
     the profile's store is unusable; the caller parks it (and releases the reservation). Its
     queued native rows are recovered once its adapters connect (``recover_served_native_rows``)."""
-    from gateway.session_authorities import owner_scope
+    from gateway.session_authorities import async_owner_scope
     from gateway.session_hosted_service import _ensure_hosted_service, start_ready_hosted_services
     from gateway.session_local_recovery import recover_local_sessions
     from gateway.platforms.webhook_ingress import recover_webhook_finalizations
@@ -470,7 +470,7 @@ async def serve_profile_runtime(runner, name, home):
         return existing
     authority = await _build_profile_authority(runner, name, home, register=False)
     try:
-        with owner_scope(authority):
+        async with async_owner_scope(authority):
             _drop_retired_local_adapter(authority)
             await recover_bot_mailbox(authority)
             recover_local_sessions(authority, schedule=True)
