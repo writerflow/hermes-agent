@@ -40,11 +40,11 @@ def owner_for_home(home):
 
 async def _admit_local_delivery(authority, chat_id, text, metadata):
     from gateway.config import Platform
-    from gateway.session_authorities import owner_scope
+    from gateway.session_authorities import async_owner_scope
     from gateway.session_automation import admit_route_wake
     from gateway.session_local_recovery import local_adapter_map, restore_local_session
     from gateway.session_route_recovery import mountable, restore_routed_session
-    with owner_scope(authority):
+    async with async_owner_scope(authority):
         live = authority.sessions.get(chat_id)
         if live is None and mountable(authority, chat_id):
             # A messaging conversation a reminder set from the app names (gateway/session_detached.py),
