@@ -522,15 +522,17 @@ class GatewayRuntimeAPI:
         # The ticket names the served profile; this connection binds to that home's authority.
         scope['hermes.session_authority'] = authority
         from gateway.session_contract import CANONICAL_GATEWAY_PROTOCOL
-        from gateway.session_authorities import owner_scope
+        from gateway.session_authorities import bind_prepared_owner_scope, prepare_owner_scope
         # Counted before the handler fetch yields: the ticket is already redeemed, so an idle check
         # in between would otherwise see no client and exit under this first connection.
         with attached_client(self.runner):
             handle_ws = await session_socket_handler()
-            if refused():  # a drain or stop that began while the handler loaded
+            # The profile read runs in a worker (not on the loop); only the binding below is on it.
+            prepared = await prepare_owner_scope(authority)
+            if refused():  # a drain or stop that began while the handler loaded or the profile was read
                 await ws.close(code=1013)
                 return
-            with owner_scope(authority):
+            with bind_prepared_owner_scope(authority, prepared):
                 await handle_ws(ws, auth_identity={'user_id': grant['subject'], 'provider': 'local',
                                                   'profile_id': grant['profile_id'],
                                                   'instance_id': grant['instance_id'],

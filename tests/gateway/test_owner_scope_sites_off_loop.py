@@ -13,7 +13,7 @@ fails instead of passing vacuously) and location (no read for the case's home on
 
 import asyncio
 import threading
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -745,3 +745,696 @@ async def test_site_session_hosted_transport_target_handler_runs_on_a_producer_w
     _assert_reach(reads, home, n0)
     _assert_off_loop(reads, home, threading.get_ident())
     assert reads.reads_for(home)[0][1].startswith("gateway-hosted-producer")
+
+
+# --- The 9 sync ``with owner_scope`` sites in coroutines (t_9328163d) -------------------------------------
+# Each case drives the real public entry, passes the reach assertion on the unchanged tree (the site read
+# the profile files, so the fixture reached it) and fails location there until the site is moved off the loop.
+
+def _expected_scope(authority):
+    from gateway.session_authorities import owner_scope
+    with owner_scope(authority):
+        return _bound()
+
+
+class _HopGate:
+    """Holds the worker-thread profile read (``_prepare_owner_scope``) open until released."""
+
+    def __init__(self, monkeypatch):
+        from gateway import session_authorities
+        self.entered, self.release = threading.Event(), threading.Event()
+        self.finished = threading.Event()
+        real = session_authorities._prepare_owner_scope
+
+        def gated(home):
+            self.entered.set()
+            assert self.release.wait(10), "hop gate never released"
+            try:
+                return real(home)
+            finally:
+                self.finished.set()
+
+        monkeypatch.setattr(session_authorities, "_prepare_owner_scope", gated)
+
+    async def wait_finished(self):
+        """The worker's profile read is done; let the loop run what that completion scheduled."""
+        for _ in range(500):
+            if self.finished.is_set():
+                break
+            await asyncio.sleep(0.01)
+        else:
+            pytest.fail("the worker-thread profile read never finished")
+        for _ in range(5):
+            await asyncio.sleep(0)
+
+    async def wait_entered(self):
+        for _ in range(500):
+            if self.entered.is_set():
+                return
+            await asyncio.sleep(0.01)
+        pytest.fail("the site never made the worker-thread profile read (no hop)")
+
+
+# --- Site 1: HostedRoomAuthorityRPC._dispatch (session_hosted_rpc.py) ---------------------------------
+
+def _hosted_rpc(tmp_path, monkeypatch, *, timeout=30, home_name="hosted-rpc"):
+    from gateway.session_hosted_rpc import HostedRoomAuthorityRPC
+    home = _make_home(tmp_path, home_name)
+    authority = _authority(home)
+    principal = SimpleNamespace(subject="alice", profile_id=str(home))
+    rpc = HostedRoomAuthorityRPC(authority, asyncio.get_running_loop(), room_id="room", member_id="m",
+                                 profile="default", principal=principal, authorize=lambda *a: True,
+                                 timeout=timeout)
+    owned = []
+
+    async def dispatch_owned(operation, params):
+        owned.append((operation, threading.get_ident(), _bound()))
+        return {"ok": operation}
+
+    monkeypatch.setattr(rpc, "_dispatch_owned", dispatch_owned)
+    return home, authority, rpc, owned
+
+
+@pytest.mark.asyncio
+async def test_site_hosted_rpc_dispatch_reads_the_profile_off_the_loop(tmp_path, reads, n0, monkeypatch):
+    home, _auth, rpc, owned = _hosted_rpc(tmp_path, monkeypatch)
+    assert await asyncio.to_thread(rpc._call, "submit") == {"ok": "submit"}
+    _assert_reach(reads, home, n0)
+    _assert_off_loop(reads, home, threading.get_ident())
+    assert len(owned) == 1 and owned[0][1] == threading.get_ident()  # the guarded work stays on the loop
+
+
+@pytest.mark.asyncio
+async def test_site_hosted_rpc_dispatch_binds_what_owner_scope_binds(tmp_path, reads, n0, monkeypatch):
+    home, authority, rpc, owned = _hosted_rpc(tmp_path, monkeypatch)
+    expected = _expected_scope(authority)
+    assert expected["home"] == str(home)
+    await asyncio.to_thread(rpc._call, "submit")
+    assert [b for _o, _t, b in owned] == [expected]
+    assert _bound()["home"] != str(home), "the scope leaked past the dispatch"
+
+
+@pytest.mark.asyncio
+async def test_site_hosted_rpc_timeout_during_the_hop_never_cancels_the_dispatch(tmp_path, reads, n0, monkeypatch):
+    """A caller timeout is ambiguous: the dispatch is not cancelled, so it may still admit, once, under the owner."""
+    home, authority, rpc, owned = _hosted_rpc(tmp_path, monkeypatch, timeout=0.2)
+    expected = _expected_scope(authority)
+    reads.reads.clear()
+    gate = _HopGate(monkeypatch)
+    call = asyncio.create_task(asyncio.to_thread(rpc._call, "submit"))
+    await gate.wait_entered()
+    with pytest.raises(TimeoutError):
+        await call
+    assert owned == []  # still inside the hop
+    gate.release.set()
+    await gate.wait_finished()
+    assert [b for _o, _t, b in owned] == [expected], "the timed-out dispatch must still complete once, under the owner"
+    _assert_off_loop(reads, home, threading.get_ident())
+
+
+@pytest.mark.asyncio
+async def test_site_hosted_rpc_task_cancellation_during_the_hop_runs_nothing(tmp_path, reads, n0, monkeypatch):
+    home, _auth, rpc, owned = _hosted_rpc(tmp_path, monkeypatch)
+    before = _bound()
+    gate = _HopGate(monkeypatch)
+    task = asyncio.create_task(rpc._dispatch("submit", {}))
+    await gate.wait_entered()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    gate.release.set()
+    await gate.wait_finished()
+    assert owned == [] and _bound() == before
+    assert reads.on_loop(home, threading.get_ident()) == []
+
+
+@pytest.mark.asyncio
+async def test_site_hosted_rpc_unrouted_owner_reads_nothing_and_binds_the_launch_scope(tmp_path, reads, n0, monkeypatch):
+    from gateway.session_hosted_rpc import HostedRoomAuthorityRPC
+    launch = _make_home(tmp_path, "launch")
+    with _launch_hosting(launch, monkeypatch):
+        authority = SimpleNamespace(profile_id="fixture", runner=SimpleNamespace(config=SimpleNamespace(multiplex_profiles=False)))
+        expected = _expected_scope(authority)
+        assert expected["home"] == str(launch) and expected["secrets"]
+        principal = SimpleNamespace(subject="alice", profile_id="fixture")
+        rpc = HostedRoomAuthorityRPC(authority, asyncio.get_running_loop(), room_id="room", member_id="m",
+                                     profile="default", principal=principal, authorize=lambda *a: True)
+        got = []
+
+        async def dispatch_owned(operation, params):
+            got.append(_bound())
+
+        monkeypatch.setattr(rpc, "_dispatch_owned", dispatch_owned)
+        reads.reads.clear()
+        await asyncio.to_thread(rpc._call, "submit")
+    assert got == [expected]
+    assert reads.reads_for(Path("fixture")) == []
+
+
+@contextmanager
+def _launch_hosting(launch, monkeypatch):
+    """Host several profiles (as the unrouted case above does) so an unrouted owner binds the launch scope."""
+    from agent import secret_scope
+    from tui_gateway import launch_profile_policy
+    monkeypatch.setenv("HERMES_HOME", str(launch))
+    monkeypatch.setattr(launch_profile_policy, "_snapshot", None)
+    previous = secret_scope.is_multiplex_active()
+    launch_profile_policy.activate_multi_profile_hosting()
+    try:
+        yield
+    finally:
+        secret_scope.set_multiplex_active(previous)
+
+
+# --- Site 2: GatewayRuntimeAPI._serve (run_api.py), one scope per WebSocket connection ---------------
+
+def _attach_world(tmp_path, monkeypatch, name="ws-serve", *, unrouted=False):
+    """Attach over the real ``/api/ws`` admission for a routed (multiplexed) owner with its own home.
+
+    Returns ``(home, authority, runner, handled, sent, start)``; ``start()`` makes the connection.
+    """
+    from gateway import run_api
+    from gateway.run_api import GatewayRuntimeAPI
+    from gateway.runtime_bootstrap import TicketStore
+    from hermes_cli import web_server as web
+    from hermes_cli import web_server_chat
+    from tests.gateway.test_session_socket_preload import _attach_scope
+
+    home = _make_home(tmp_path, name)
+    tickets = TicketStore("owner", [str(home)])
+    ticket = tickets.mint(profile_id=str(home), subject="human", purpose="interactive")
+    authority = SimpleNamespace(db=SimpleNamespace(db_path=home / "state.db"), profile_id=str(home),
+                                runner=SimpleNamespace(config=SimpleNamespace(multiplex_profiles=not unrouted)))
+    runner = SimpleNamespace(_draining=False, session_runtime_descriptor={"state": "ready"},
+                             session_authority=authority, session_ticket_store=tickets)
+    handled, sent = [], []
+
+    async def handler_factory():
+        async def handle(ws, **kwargs):
+            handled.append((threading.get_ident(), _bound()))
+            await ws.close()
+        return handle
+
+    monkeypatch.setattr(run_api, "session_socket_handler", handler_factory)
+    monkeypatch.setattr(web, "_DASHBOARD_EMBEDDED_CHAT_ENABLED", True)
+    monkeypatch.setattr(web_server_chat, "_ws_request_is_allowed", lambda ws: True)
+
+    async def fallback(*args):
+        pytest.fail("a native ticket must not enter the legacy fallback")
+
+    incoming = iter([{"type": "websocket.connect"}])
+
+    async def receive():
+        return next(incoming)
+
+    async def send(value):
+        sent.append(value)
+
+    def start():
+        return asyncio.create_task(GatewayRuntimeAPI(fallback, runner, web.app)(_attach_scope(ticket), receive, send))
+
+    return home, authority, runner, handled, sent, start
+
+
+@pytest.mark.asyncio
+async def test_site_ws_serve_reads_the_profile_off_the_loop(tmp_path, reads, n0, monkeypatch):
+    home, _auth, _runner, handled, _sent, start = _attach_world(tmp_path, monkeypatch)
+    await start()
+    assert len(handled) == 1
+    _assert_reach(reads, home, n0)
+    _assert_off_loop(reads, home, threading.get_ident())
+
+
+@pytest.mark.asyncio
+async def test_site_ws_serve_handler_sees_the_owners_binding(tmp_path, reads, n0, monkeypatch):
+    home, authority, _runner, handled, _sent, start = _attach_world(tmp_path, monkeypatch)
+    expected = _expected_scope(authority)
+    assert expected["home"] == str(home)
+    await start()
+    assert [b for _t, b in handled] == [expected]
+    assert handled[0][0] == threading.get_ident()
+
+
+@pytest.mark.asyncio
+async def test_site_ws_serve_drain_during_the_hop_refuses_with_1013_and_never_calls_the_handler(tmp_path, reads, n0, monkeypatch):
+    from gateway import run_idle_exit
+    home, _auth, runner, handled, sent, start = _attach_world(tmp_path, monkeypatch)
+    gate = _HopGate(monkeypatch)
+    task = start()
+    await gate.wait_entered()
+    assert run_idle_exit._client_busy(runner, window=0.0) == "1 client(s) attached"  # counted through the hop
+    runner._draining = True  # a drain that begins while the profile read is in flight
+    gate.release.set()
+    await task
+    assert handled == []
+    assert sent[-1] == {"type": "websocket.close", "code": 1013, "reason": ""}
+    assert _bound()["home"] != str(home)
+
+
+# --- Site 3: serve_profile_runtime (run_runtime.py), one scope per profile served ---------------------
+
+class _ServeRegistry:
+    def __init__(self):
+        self.removed = []
+
+    def for_home(self, home):
+        return None
+
+    def remove(self, home):
+        self.removed.append(Path(home).resolve())
+
+
+def _serve_world(tmp_path, monkeypatch):
+    """A real ``serve_profile_runtime`` over a routed home; every recovery step records its binding."""
+    from gateway import run_runtime
+    from gateway import session_hosted_service
+    from gateway.platforms import webhook_ingress
+    from gateway import session_local_recovery
+
+    home = _make_home(tmp_path, "served").resolve()
+    authority = _authority(home)
+    registry = _ServeRegistry()
+    runner = SimpleNamespace(session_authorities=registry, session_control_server=None)
+    steps, retired = [], []
+
+    def record(step):
+        steps.append((step, threading.get_ident(), _bound()))
+
+    async def build(*args, **kwargs):
+        return authority
+
+    async def retire(auth, timeout=None):
+        retired.append(auth)
+        return True
+
+    async def mailbox(auth):
+        record("bot_mailbox")
+
+    async def webhook(auth):
+        record("webhook")
+
+    monkeypatch.setattr(run_runtime, "_build_profile_authority", build)
+    monkeypatch.setattr(run_runtime, "_retire_profile_authority", retire)
+    monkeypatch.setattr(run_runtime, "_publish_served_set", lambda r: None)
+    monkeypatch.setattr(run_runtime, "_drop_retired_local_adapter", lambda a: record("drop_adapter"))
+    monkeypatch.setattr(run_runtime, "recover_bot_mailbox", mailbox)
+    monkeypatch.setattr(run_runtime, "_recover_published_api_turns", lambda r, a: record("api_turns"))
+    monkeypatch.setattr(session_local_recovery, "recover_local_sessions", lambda a, schedule: record("local_sessions"))
+    monkeypatch.setattr(webhook_ingress, "recover_webhook_finalizations", webhook)
+    monkeypatch.setattr(session_hosted_service, "start_ready_hosted_services", lambda r: None)
+    return home, authority, runner, registry, steps, retired
+
+
+_SERVE_ORDER = ["drop_adapter", "bot_mailbox", "local_sessions", "webhook", "api_turns"]
+
+
+@pytest.mark.asyncio
+async def test_site_serve_profile_runtime_reads_the_profile_off_the_loop(tmp_path, reads, n0, monkeypatch):
+    from gateway import run_runtime
+    home, authority, runner, _registry, steps, _retired = _serve_world(tmp_path, monkeypatch)
+    expected = _expected_scope(authority)
+    reads.reads.clear()
+    assert await run_runtime.serve_profile_runtime(runner, "served", home) is authority
+    _assert_reach(reads, home, n0)
+    _assert_off_loop(reads, home, threading.get_ident())
+    assert [s for s, _t, _b in steps] == _SERVE_ORDER
+    assert all(b == expected and t == threading.get_ident() for _s, t, b in steps)
+
+
+@pytest.mark.asyncio
+async def test_site_serve_profile_runtime_a_failing_prepare_retires_the_authority(tmp_path, reads, n0, monkeypatch):
+    from gateway import run_runtime, session_authorities
+    home, authority, runner, registry, steps, retired = _serve_world(tmp_path, monkeypatch)
+
+    async def unreadable(auth):
+        raise OSError("profile unreadable")
+
+    monkeypatch.setattr(session_authorities, "prepare_owner_scope", unreadable)
+    with pytest.raises(OSError, match="profile unreadable"):
+        await run_runtime.serve_profile_runtime(runner, "served", home)
+    assert retired == [authority] and registry.removed == [home] and steps == []
+
+
+@pytest.mark.asyncio
+async def test_site_serve_profile_runtime_cancel_during_prepare_retires_the_authority(tmp_path, reads, n0, monkeypatch):
+    from gateway import run_runtime
+    home, authority, runner, registry, steps, retired = _serve_world(tmp_path, monkeypatch)
+    gate = _HopGate(monkeypatch)
+    task = asyncio.create_task(run_runtime.serve_profile_runtime(runner, "served", home))
+    await gate.wait_entered()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    gate.release.set()
+    assert retired == [authority] and registry.removed == [home] and steps == []
+
+
+# --- Site 4: _recover_profile_bot_mailbox (run_runtime.py), startup Bot Chat recovery per profile ----
+
+class _MailboxRegistry(_ServeRegistry):
+    def __init__(self, name):
+        super().__init__()
+        self.name = name
+
+    def profile_name(self, authority):
+        return self.name
+
+
+def _mailbox_world(tmp_path, monkeypatch, *, name):
+    """``name`` is the profile's name, or None for the launch profile."""
+    from gateway import run_runtime
+    home = _make_home(tmp_path, "mailbox").resolve()
+    authority = _authority(home)
+    registry = _MailboxRegistry(name)
+    runner = SimpleNamespace(session_authorities=registry)
+    recovered, retired, parked = [], [], []
+
+    async def mailbox(auth):
+        recovered.append((threading.get_ident(), _bound()))
+
+    async def retire(auth, timeout=None):
+        retired.append(auth)
+        return True
+
+    monkeypatch.setattr(run_runtime, "recover_bot_mailbox", mailbox)
+    monkeypatch.setattr(run_runtime, "_retire_profile_authority", retire)
+    monkeypatch.setattr(run_runtime, "_publish_served_set", lambda r: None)
+    monkeypatch.setattr(run_runtime, "release_profile_home", lambda r, h: None)
+    monkeypatch.setattr(run_runtime, "park_profile", lambda r, n, reason: parked.append((n, reason)))
+    return home, authority, runner, registry, recovered, retired, parked
+
+
+@pytest.mark.asyncio
+async def test_site_bot_mailbox_recovery_reads_the_profile_off_the_loop(tmp_path, reads, n0, monkeypatch):
+    from gateway import run_runtime
+    home, authority, runner, _registry, recovered, _retired, parked = _mailbox_world(tmp_path, monkeypatch, name="beta")
+    expected = _expected_scope(authority)
+    reads.reads.clear()
+    await run_runtime._recover_profile_bot_mailbox(runner, authority)
+    _assert_reach(reads, home, n0)
+    _assert_off_loop(reads, home, threading.get_ident())
+    assert recovered == [(threading.get_ident(), expected)] and parked == []
+
+
+@pytest.mark.asyncio
+async def test_site_bot_mailbox_recovery_a_failing_prepare_parks_a_secondary(tmp_path, reads, n0, monkeypatch):
+    from gateway import run_runtime, session_authorities
+    home, authority, runner, registry, recovered, retired, parked = _mailbox_world(tmp_path, monkeypatch, name="beta")
+
+    async def unreadable(auth):
+        raise OSError("profile unreadable")
+
+    monkeypatch.setattr(session_authorities, "prepare_owner_scope", unreadable)
+    await run_runtime._recover_profile_bot_mailbox(runner, authority)
+    assert recovered == [] and retired == [authority] and registry.removed == [home]
+    assert [n for n, _r in parked] == ["beta"] and "profile unreadable" in parked[0][1]
+
+
+@pytest.mark.asyncio
+async def test_site_bot_mailbox_recovery_a_failing_prepare_aborts_the_launch_profile(tmp_path, reads, n0, monkeypatch):
+    from gateway import run_runtime, session_authorities
+    _home, authority, runner, _registry, recovered, retired, parked = _mailbox_world(tmp_path, monkeypatch, name=None)
+
+    async def unreadable(auth):
+        raise OSError("profile unreadable")
+
+    monkeypatch.setattr(session_authorities, "prepare_owner_scope", unreadable)
+    with pytest.raises(OSError, match="profile unreadable"):
+        await run_runtime._recover_profile_bot_mailbox(runner, authority)
+    assert recovered == [] and retired == [] and parked == []
+
+
+# --- Sites 5 and 6: native-session recovery (run_runtime.py) -----------------------------------------
+# Site 5 (``recover_gateway_native_sessions``) enters one scope per authority and then calls site 6
+# (``recover_profile_native_sessions``), which enters its own: each home sees two scope entries.
+
+def _recovery_world(tmp_path, monkeypatch, names=("rec-a", "rec-b")):
+    from gateway import session_detached, session_hosted_service, session_local_recovery
+    from gateway.platforms import webhook_ingress
+    homes = [_make_home(tmp_path, name).resolve() for name in names]
+    steps, native = [], []
+    authorities = []
+    for home in homes:
+        async def recover_native(bindings, _home=home):
+            native.append((str(_home), threading.get_ident(), _bound()))
+            return {}
+
+        authorities.append(_authority(
+            home, db=SimpleNamespace(_read_all=lambda sql: []), logical_owner=lambda sid: sid,
+            recover_native_sessions=recover_native))
+    runner = SimpleNamespace(session_authorities=SimpleNamespace(serving=lambda: list(authorities)),
+                             session_store=SimpleNamespace(list_sessions=list))
+
+    async def ensure(_runner):
+        return None
+
+    async def webhook(auth):
+        steps.append(("webhook", auth.profile_id, _bound()["home"]))
+
+    monkeypatch.setattr(session_hosted_service, "ensure_hosted_service", ensure)
+    monkeypatch.setattr(session_local_recovery, "recover_local_sessions",
+                        lambda auth, schedule: steps.append(("local", auth.profile_id, _bound()["home"])))
+    monkeypatch.setattr(webhook_ingress, "recover_webhook_finalizations", webhook)
+    monkeypatch.setattr(session_detached, "recover_detached_sessions", lambda auth, pending: [])
+    return homes, authorities, runner, steps, native
+
+
+@pytest.mark.asyncio
+async def test_site_recover_profile_native_sessions_reads_the_profile_off_the_loop(tmp_path, reads, n0, monkeypatch):
+    from gateway import run_runtime
+    homes, authorities, runner, _steps, native = _recovery_world(tmp_path, monkeypatch, names=("rec-a",))
+    expected = _expected_scope(authorities[0])
+    reads.reads.clear()
+    assert await run_runtime.recover_profile_native_sessions(runner, authorities[0]) == {}
+    _assert_reach(reads, homes[0], n0)
+    _assert_off_loop(reads, homes[0], threading.get_ident())
+    assert native == [(str(homes[0]), threading.get_ident(), expected)]
+
+
+@pytest.mark.asyncio
+async def test_site_recover_gateway_native_sessions_reads_each_profile_off_the_loop(tmp_path, reads, n0, monkeypatch):
+    from gateway import run_runtime
+    homes, authorities, runner, steps, native = _recovery_world(tmp_path, monkeypatch)
+    expected = {a.profile_id: _expected_scope(a) for a in authorities}
+    reads.reads.clear()
+    assert await run_runtime.recover_gateway_native_sessions(runner) == {}
+    loop_ident = threading.get_ident()
+    for home in homes:
+        # Two entries per home: site 5's own, then site 6's (``recover_profile_native_sessions`` is not stubbed).
+        _assert_reach(reads, home, 2 * n0)
+        _assert_off_loop(reads, home, loop_ident)
+    # Per-authority isolation and order: each home's steps ran under that home's binding.
+    assert steps == [(step, str(home), str(home)) for home in homes for step in ("local", "webhook")]
+    assert [(h, b) for h, _t, b in native] == [(str(home), expected[str(home)]) for home in homes]
+
+
+# --- Site 7: _admit_local_delivery (session_cron.py), one scope per cron delivery to a local chat -----
+
+class _RecordingSessions(dict):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.gets = []
+
+    def get(self, key, default=None):
+        self.gets.append(key)
+        return super().get(key, default)
+
+
+def _delivery_world(tmp_path, monkeypatch, *, known=True):
+    from gateway import session_automation, session_cron, session_local_recovery, session_route_recovery
+    from gateway.config import Platform
+    home = _make_home(tmp_path, "delivery").resolve()
+    source = SimpleNamespace(platform=Platform.TELEGRAM)
+    live = SimpleNamespace(source=source)
+    sessions = _RecordingSessions({"chat1": live} if known else {})
+    adapter = object()
+    authority = _authority(home, sessions=sessions, db=SimpleNamespace(db_path=home / "state.db"))
+    authority.runner._adapter_for_source = lambda src: adapter
+    admitted = []
+
+    async def admit_route_wake(runner, adp, src, text, kind, metadata):
+        admitted.append((threading.get_ident(), _bound(), adp is adapter, text, kind))
+        return True
+
+    def restore_local_session(auth, chat_id):
+        raise KeyError(chat_id)
+
+    monkeypatch.setattr(session_automation, "admit_route_wake", admit_route_wake)
+    monkeypatch.setattr(session_local_recovery, "restore_local_session", restore_local_session)
+    monkeypatch.setattr(session_route_recovery, "mountable", lambda auth, chat_id: False)
+    session_cron.bind_owner(authority)
+    return home, authority, sessions, admitted, session_cron
+
+
+@pytest.mark.asyncio
+async def test_site_cron_local_delivery_reads_the_profile_off_the_loop(tmp_path, reads, n0, monkeypatch):
+    home, authority, _sessions, admitted, session_cron = _delivery_world(tmp_path, monkeypatch)
+    try:
+        expected = _expected_scope(authority)
+        reads.reads.clear()
+        assert await asyncio.to_thread(session_cron.deliver_to_local_chat, home, "chat1", "fire") is None
+    finally:
+        session_cron.unbind_owner(authority)
+    _assert_reach(reads, home, n0)
+    _assert_off_loop(reads, home, threading.get_ident())
+    assert admitted == [(threading.get_ident(), expected, True, "fire", "cron")]
+
+
+@pytest.mark.asyncio
+async def test_site_cron_local_delivery_looks_the_chat_up_only_after_the_hop(tmp_path, reads, n0, monkeypatch):
+    home, authority, sessions, _admitted, session_cron = _delivery_world(tmp_path, monkeypatch, known=False)
+    try:
+        gate = _HopGate(monkeypatch)
+        call = asyncio.create_task(asyncio.to_thread(session_cron.deliver_to_local_chat, home, "gone", "fire"))
+        await gate.wait_entered()
+        assert sessions.gets == []  # nothing read from the authority while the profile read is in flight
+        gate.release.set()
+        message = await call
+    finally:
+        session_cron.unbind_owner(authority)
+    assert sessions.gets == ["gone"]
+    assert message is not None and "KeyError" in message  # an unknown chat still surfaces as before
+
+
+# --- Site 8: cron operation ``submit`` (session_cron.py), one scope per cron submit -------------------
+
+def _submit_world(tmp_path, monkeypatch, *, unrouted=False):
+    """The real ``operation(authority, 'submit', ...)`` with the real admission check; ``_create`` records."""
+    import types
+    from gateway import session_cron, session_runtime_workers
+    from gateway.session_authority import SessionAuthority
+    from gateway.session_contract import SessionRef
+    home = _make_home(tmp_path, "submit").resolve()
+    authority = _authority(home, db=SimpleNamespace(), epoch=1, retiring=False, retired=False)
+    authority.runner._draining = False
+    authority.runner.config.multiplex_profiles = not unrouted
+    authority._require_admission_open = types.MethodType(SessionAuthority._require_admission_open, authority)
+    authority._admission_gate = lambda *a, **k: None
+    authority._admitted = lambda *a, **k: None
+    authority._schedule_admitted = lambda *a, **k: None
+    created = []
+
+    def create(auth, actor, params):
+        created.append((threading.get_ident(), _bound()))
+        return SessionRef(authority.profile_id, "sid1"), "req1"
+
+    async def tracked_write(auth, write, then=None, *, ordered=False, after=None):
+        return SimpleNamespace(admission_id="adm1")
+
+    monkeypatch.setattr(session_cron, "_create", create)
+    monkeypatch.setattr(session_runtime_workers, "tracked_write", tracked_write)
+    params = {"job_id": "job1", "request_id": "exec1", "extra_prompt": None}
+    return home, authority, created, params, session_cron
+
+
+@pytest.mark.asyncio
+async def test_site_cron_submit_reads_the_profile_off_the_loop(tmp_path, reads, n0, monkeypatch):
+    home, authority, created, params, session_cron = _submit_world(tmp_path, monkeypatch)
+    expected = _expected_scope(authority)
+    reads.reads.clear()
+    result = await session_cron.operation(authority, "submit", params)
+    assert result == {"session_id": "sid1", "admission_id": "adm1"}
+    _assert_reach(reads, home, n0)
+    _assert_off_loop(reads, home, threading.get_ident())
+    assert created == [(threading.get_ident(), expected)]  # create still runs on the loop, under the owner
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("how", ["retiring", "runner_draining"])
+async def test_site_cron_submit_a_drain_during_the_hop_is_refused_and_creates_nothing(tmp_path, reads, n0, monkeypatch, how):
+    from hermes_state_runtime import RuntimeStoreError
+    _home, authority, created, params, session_cron = _submit_world(tmp_path, monkeypatch)
+    gate = _HopGate(monkeypatch)
+    task = asyncio.create_task(session_cron.operation(authority, "submit", params))
+    await gate.wait_entered()
+    if how == "retiring":
+        authority.retiring = True
+    else:
+        authority.runner._draining = True  # the drain begins while the profile read is in flight
+    gate.release.set()
+    with pytest.raises(RuntimeStoreError) as raised:
+        await task
+    assert raised.value.reason == "runtime_draining"
+    assert created == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("how", ["retiring", "runner_draining"])
+async def test_site_cron_submit_an_already_draining_authority_is_refused_before_any_file_read(tmp_path, reads, n0, monkeypatch, how):
+    from hermes_state_runtime import RuntimeStoreError
+    home, authority, created, params, session_cron = _submit_world(tmp_path, monkeypatch)
+    reads.reads.clear()
+    if how == "retiring":
+        authority.retiring = True
+    else:
+        authority.runner._draining = True
+    with pytest.raises(RuntimeStoreError) as raised:
+        await session_cron.operation(authority, "submit", params)
+    assert raised.value.reason == "runtime_draining"
+    assert created == [] and reads.reads_for(home) == []
+
+
+# --- Site 9: onboarding ``start`` (session_onboarding.py), one scope per call that hops to a sibling --
+
+def _onboarding_world(tmp_path, monkeypatch):
+    """A connection whose onboarding sibling (the default profile) owns the work; the real ``start`` recurses."""
+    from gateway import session_onboarding
+    home = _make_home(tmp_path, "onboarding-default").resolve()
+    asking = _make_home(tmp_path, "onboarding-asker").resolve()
+    target = SimpleNamespace(authority=_authority(home), actor=SimpleNamespace(capabilities=frozenset()),
+                             _sibling_for=lambda name: None)
+    connection = SimpleNamespace(authority=_authority(asking), actor=SimpleNamespace(capabilities=frozenset()),
+                                 _sibling_for=lambda name: target)
+    real_start, entered = session_onboarding.start, []
+
+    async def start(conn, ref, params):
+        if conn is target:
+            entered.append((threading.get_ident(), _bound()))
+            return {"started": True}
+        return await real_start(conn, ref, params)
+
+    monkeypatch.setattr(session_onboarding, "start", start)
+    return home, asking, target, connection, entered, real_start
+
+
+@pytest.mark.asyncio
+async def test_site_onboarding_start_reads_the_sibling_profile_off_the_loop(tmp_path, reads, n0, monkeypatch):
+    home, asking, target, connection, entered, real_start = _onboarding_world(tmp_path, monkeypatch)
+    expected = _expected_scope(target.authority)
+    reads.reads.clear()
+    assert await real_start(connection, None, {}) == {"started": True}
+    _assert_reach(reads, home, n0)  # one scope entry for the one hop
+    _assert_off_loop(reads, home, threading.get_ident())
+    assert reads.reads_for(asking) == []  # the asking profile's scope belongs to dispatch, not to this call
+    assert entered == [(threading.get_ident(), expected)]
+    assert expected["home"] == str(home)
+
+
+# --- Unrouted owners at the two sites that bind a prepared scope themselves (sites 2 and 8) -----------
+# A symbolic or single-profile owner prepares ``None``; binding it must give exactly what the sync
+# ``owner_scope`` gives (the launch scope under multi-profile hosting), with no profile read.
+
+@pytest.mark.asyncio
+async def test_site_ws_serve_unrouted_owner_binds_the_launch_scope(tmp_path, reads, n0, monkeypatch):
+    launch = _make_home(tmp_path, "launch-ws")
+    with _launch_hosting(launch, monkeypatch):
+        home, authority, _runner, handled, _sent, start = _attach_world(tmp_path, monkeypatch, unrouted=True)
+        expected = _expected_scope(authority)
+        assert expected["home"] == str(launch) and expected["secrets"]
+        reads.reads.clear()
+        await start()
+    assert [b for _t, b in handled] == [expected]
+    assert reads.reads_for(home) == []
+
+
+@pytest.mark.asyncio
+async def test_site_cron_submit_unrouted_owner_binds_the_launch_scope(tmp_path, reads, n0, monkeypatch):
+    launch = _make_home(tmp_path, "launch-cron")
+    with _launch_hosting(launch, monkeypatch):
+        home, authority, created, params, session_cron = _submit_world(tmp_path, monkeypatch, unrouted=True)
+        expected = _expected_scope(authority)
+        assert expected["home"] == str(launch) and expected["secrets"]
+        reads.reads.clear()
+        await session_cron.operation(authority, "submit", params)
+    assert created == [(threading.get_ident(), expected)]
+    assert reads.reads_for(home) == []

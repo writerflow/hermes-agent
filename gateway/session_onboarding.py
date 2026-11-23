@@ -54,8 +54,8 @@ async def start(connection, ref, params):
     target = _onboarding_connection(connection)
     if target is not connection:
         # Dispatch entered the asking profile's scope; the claim, the facts and the chat's policy are default's.
-        from gateway.session_authorities import owner_scope
-        with owner_scope(target.authority):
+        from gateway.session_authorities import async_owner_scope
+        async with async_owner_scope(target.authority):
             return await start(target, ref, params)
     if 'session:create' not in connection.actor.capabilities:
         raise RuntimeStoreError('permission_denied')
