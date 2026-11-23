@@ -654,7 +654,7 @@ async def recover_gateway_native_sessions(runner):
     Stored envelopes are input, not authority to create a route or reconnect a
     transport. The authority preflights every queued sender before any claim.
     """
-    from gateway.session_authorities import owner_scope, serving_authorities
+    from gateway.session_authorities import async_owner_scope, serving_authorities
     authorities = serving_authorities(runner)
     if not authorities:
         return {}
@@ -664,7 +664,7 @@ async def recover_gateway_native_sessions(runner):
     from gateway.platforms.webhook_ingress import recover_webhook_finalizations
     results = {}
     for authority in authorities:
-        with owner_scope(authority):
+        async with async_owner_scope(authority):
             recover_local_sessions(authority, schedule=True)
             await recover_webhook_finalizations(authority)
         results.update(await recover_profile_native_sessions(runner, authority))
