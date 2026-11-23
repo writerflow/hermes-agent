@@ -1076,3 +1076,78 @@ async def test_site_serve_profile_runtime_cancel_during_prepare_retires_the_auth
         await task
     gate.release.set()
     assert retired == [authority] and registry.removed == [home] and steps == []
+
+
+# --- Site 4: _recover_profile_bot_mailbox (run_runtime.py), startup Bot Chat recovery per profile ----
+
+class _MailboxRegistry(_ServeRegistry):
+    def __init__(self, name):
+        super().__init__()
+        self.name = name
+
+    def profile_name(self, authority):
+        return self.name
+
+
+def _mailbox_world(tmp_path, monkeypatch, *, name):
+    """``name`` is the profile's name, or None for the launch profile."""
+    from gateway import run_runtime
+    home = _make_home(tmp_path, "mailbox").resolve()
+    authority = _authority(home)
+    registry = _MailboxRegistry(name)
+    runner = SimpleNamespace(session_authorities=registry)
+    recovered, retired, parked = [], [], []
+
+    async def mailbox(auth):
+        recovered.append((threading.get_ident(), _bound()))
+
+    async def retire(auth, timeout=None):
+        retired.append(auth)
+        return True
+
+    monkeypatch.setattr(run_runtime, "recover_bot_mailbox", mailbox)
+    monkeypatch.setattr(run_runtime, "_retire_profile_authority", retire)
+    monkeypatch.setattr(run_runtime, "_publish_served_set", lambda r: None)
+    monkeypatch.setattr(run_runtime, "release_profile_home", lambda r, h: None)
+    monkeypatch.setattr(run_runtime, "park_profile", lambda r, n, reason: parked.append((n, reason)))
+    return home, authority, runner, registry, recovered, retired, parked
+
+
+@pytest.mark.asyncio
+async def test_site_bot_mailbox_recovery_reads_the_profile_off_the_loop(tmp_path, reads, n0, monkeypatch):
+    from gateway import run_runtime
+    home, authority, runner, _registry, recovered, _retired, parked = _mailbox_world(tmp_path, monkeypatch, name="beta")
+    expected = _expected_scope(authority)
+    reads.reads.clear()
+    await run_runtime._recover_profile_bot_mailbox(runner, authority)
+    _assert_reach(reads, home, n0)
+    _assert_off_loop(reads, home, threading.get_ident())
+    assert recovered == [(threading.get_ident(), expected)] and parked == []
+
+
+@pytest.mark.asyncio
+async def test_site_bot_mailbox_recovery_a_failing_prepare_parks_a_secondary(tmp_path, reads, n0, monkeypatch):
+    from gateway import run_runtime, session_authorities
+    home, authority, runner, registry, recovered, retired, parked = _mailbox_world(tmp_path, monkeypatch, name="beta")
+
+    async def unreadable(auth):
+        raise OSError("profile unreadable")
+
+    monkeypatch.setattr(session_authorities, "prepare_owner_scope", unreadable)
+    await run_runtime._recover_profile_bot_mailbox(runner, authority)
+    assert recovered == [] and retired == [authority] and registry.removed == [home]
+    assert [n for n, _r in parked] == ["beta"] and "profile unreadable" in parked[0][1]
+
+
+@pytest.mark.asyncio
+async def test_site_bot_mailbox_recovery_a_failing_prepare_aborts_the_launch_profile(tmp_path, reads, n0, monkeypatch):
+    from gateway import run_runtime, session_authorities
+    _home, authority, runner, _registry, recovered, retired, parked = _mailbox_world(tmp_path, monkeypatch, name=None)
+
+    async def unreadable(auth):
+        raise OSError("profile unreadable")
+
+    monkeypatch.setattr(session_authorities, "prepare_owner_scope", unreadable)
+    with pytest.raises(OSError, match="profile unreadable"):
+        await run_runtime._recover_profile_bot_mailbox(runner, authority)
+    assert recovered == [] and retired == [] and parked == []
