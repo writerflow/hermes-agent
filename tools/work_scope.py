@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import time
@@ -15,6 +16,7 @@ MANAGER_PATH = "/org/freedesktop/systemd1"
 UNIT = SYSTEMD + ".Unit"
 SCOPE = SYSTEMD + ".Scope"
 OOM_POLICY = "continue"
+_CGROUP_ROOT = Path("/sys/fs/cgroup")
 
 
 class ScopeVerificationError(RuntimeError):
@@ -89,13 +91,28 @@ class ScopeBus:
             raise ScopeVerificationError("systemd scope was not active")
         return path, bytes(invocation)
 
-    def verify_scope(self, name: str, membership: str):
-        path, invocation = self.scope_identity(name, membership)
-        if self.property("s", path, SCOPE, "OOMPolicy") != OOM_POLICY:
-            raise ScopeVerificationError("systemd scope OOMPolicy did not equal continue")
-        if self.scope_identity(name, membership) != (path, invocation):
-            raise ScopeVerificationError("systemd scope invocation changed during OOMPolicy verification")
-        self.verify_owner()
+    def verify_scope(self, name: str, membership: str) -> None:
+        parts = membership.split("/")
+        if parts[0] != "" or any(part in {"", ".", ".."} for part in parts[1:]) or parts[-1] != name:
+            raise ScopeVerificationError("invalid cgroup path for scope policy readback")
+        directory = _CGROUP_ROOT.joinpath(*parts[1:])
+        # Pin the directory while reading the unit. The invocation and its
+        # path text alone cannot distinguish a replaced kernel directory.
+        try:
+            fd = os.open(directory, os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+            try:
+                path, invocation = self.scope_identity(name, membership)
+                if self.property("s", path, SCOPE, "OOMPolicy") != OOM_POLICY:
+                    raise ScopeVerificationError("systemd scope OOMPolicy did not equal continue")
+                if self.scope_identity(name, membership) != (path, invocation):
+                    raise ScopeVerificationError("systemd scope invocation changed during OOMPolicy verification")
+                self.verify_owner()
+                if not os.path.samestat(os.fstat(fd), directory.stat(follow_symlinks=False)):
+                    raise ScopeVerificationError("systemd scope cgroup changed during OOMPolicy verification")
+            finally:
+                os.close(fd)
+        except OSError as exc:
+            raise ScopeVerificationError("systemd scope cgroup identity was unreadable") from exc
 
 
 def probe_payload(name: str) -> list[str]:

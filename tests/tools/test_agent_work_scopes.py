@@ -7,7 +7,7 @@ import subprocess
 import pytest
 
 from hermes_cli import update_cmd_commit, update_cmd_posix_pause as pause
-from tools import process_registry
+from tools import process_registry, work_scope
 
 
 @pytest.mark.platforms("linux")
@@ -36,12 +36,14 @@ def test_failed_retained_scope_probe_cannot_degrade_on_warm_cache(monkeypatch, s
 
 @pytest.mark.platforms("linux")
 @pytest.mark.parametrize("bus, scope", [("--user", "user"), ("--system", "system")])
-@pytest.mark.parametrize("policy", ["continue", "stop", "kill", "changed invocation", None])
+@pytest.mark.parametrize("policy", ["continue", "stop", "kill", "changed invocation", "replaced cgroup", None])
 def test_escape_checks_policy_before_update_can_switch(monkeypatch, tmp_path, bus, scope, policy):
     original = "/hermes-gateway.service"
     action = []
     moved_to = []
     requested = []
+    cgroup_root = tmp_path / "cgroup"
+    monkeypatch.setattr(work_scope, "_CGROUP_ROOT", cgroup_root, raising=False)
     invocation_reads = iter(([31] * 16, [32 if policy == "changed invocation" else 31] * 16))
     unit = {"pid": 1, "unit": "hermes-gateway.service", "cgroup": original, "scope": scope}
     monkeypatch.setattr(pause, "_pid_cgroup", lambda pid="self": (moved_to or [original])[0])
@@ -72,6 +74,7 @@ def test_escape_checks_policy_before_update_can_switch(monkeypatch, tmp_path, bu
             args = argv[argv.index("StartTransientUnit") + 2:]
             requested.append(args)
             moved_to.append("/app.slice/" + args[0])
+            (cgroup_root / moved_to[0][1:]).mkdir(parents=True)
             data = {"type": "o", "data": ["/org/freedesktop/systemd1/job/42"]}
         elif "GetUnit" in argv:
             data = {"type": "o", "data": ["/org/freedesktop/systemd1/unit/fixture"]}
@@ -82,7 +85,12 @@ def test_escape_checks_policy_before_update_can_switch(monkeypatch, tmp_path, bu
         elif argv[-1] == "ActiveState":
             data = {"type": "s", "data": "active"}
         elif argv[-1] == "OOMPolicy" and policy is not None:
-            data = {"type": "s", "data": "continue" if policy == "changed invocation" else policy}
+            if policy == "replaced cgroup":
+                target = cgroup_root / moved_to[0][1:]
+                target.rename(target.with_name("original.scope"))
+                target.mkdir()
+            value = "continue" if policy in {"changed invocation", "replaced cgroup"} else policy
+            data = {"type": "s", "data": value}
         return subprocess.CompletedProcess(argv, 0 if data else 1, json.dumps(data), "")
 
     monkeypatch.setattr(pause.subprocess, "run", manager)
