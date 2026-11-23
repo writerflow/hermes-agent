@@ -893,3 +893,88 @@ def _launch_hosting(launch, monkeypatch):
         yield
     finally:
         secret_scope.set_multiplex_active(previous)
+
+
+# --- Site 2: GatewayRuntimeAPI._serve (run_api.py), one scope per WebSocket connection ---------------
+
+def _attach_world(tmp_path, monkeypatch, name="ws-serve"):
+    """Attach over the real ``/api/ws`` admission for a routed (multiplexed) owner with its own home.
+
+    Returns ``(home, authority, runner, handled, sent, start)``; ``start()`` makes the connection.
+    """
+    from gateway import run_api
+    from gateway.run_api import GatewayRuntimeAPI
+    from gateway.runtime_bootstrap import TicketStore
+    from hermes_cli import web_server as web
+    from hermes_cli import web_server_chat
+    from tests.gateway.test_session_socket_preload import _attach_scope
+
+    home = _make_home(tmp_path, name)
+    tickets = TicketStore("owner", [str(home)])
+    ticket = tickets.mint(profile_id=str(home), subject="human", purpose="interactive")
+    authority = SimpleNamespace(db=SimpleNamespace(db_path=home / "state.db"), profile_id=str(home),
+                                runner=SimpleNamespace(config=SimpleNamespace(multiplex_profiles=True)))
+    runner = SimpleNamespace(_draining=False, session_runtime_descriptor={"state": "ready"},
+                             session_authority=authority, session_ticket_store=tickets)
+    handled, sent = [], []
+
+    async def handler_factory():
+        async def handle(ws, **kwargs):
+            handled.append((threading.get_ident(), _bound()))
+            await ws.close()
+        return handle
+
+    monkeypatch.setattr(run_api, "session_socket_handler", handler_factory)
+    monkeypatch.setattr(web, "_DASHBOARD_EMBEDDED_CHAT_ENABLED", True)
+    monkeypatch.setattr(web_server_chat, "_ws_request_is_allowed", lambda ws: True)
+
+    async def fallback(*args):
+        pytest.fail("a native ticket must not enter the legacy fallback")
+
+    incoming = iter([{"type": "websocket.connect"}])
+
+    async def receive():
+        return next(incoming)
+
+    async def send(value):
+        sent.append(value)
+
+    def start():
+        return asyncio.create_task(GatewayRuntimeAPI(fallback, runner, web.app)(_attach_scope(ticket), receive, send))
+
+    return home, authority, runner, handled, sent, start
+
+
+@pytest.mark.asyncio
+async def test_site_ws_serve_reads_the_profile_off_the_loop(tmp_path, reads, n0, monkeypatch):
+    home, _auth, _runner, handled, _sent, start = _attach_world(tmp_path, monkeypatch)
+    await start()
+    assert len(handled) == 1
+    _assert_reach(reads, home, n0)
+    _assert_off_loop(reads, home, threading.get_ident())
+
+
+@pytest.mark.asyncio
+async def test_site_ws_serve_handler_sees_the_owners_binding(tmp_path, reads, n0, monkeypatch):
+    home, authority, _runner, handled, _sent, start = _attach_world(tmp_path, monkeypatch)
+    expected = _expected_scope(authority)
+    assert expected["home"] == str(home)
+    await start()
+    assert [b for _t, b in handled] == [expected]
+    assert handled[0][0] == threading.get_ident()
+
+
+@pytest.mark.asyncio
+async def test_site_ws_serve_drain_during_the_hop_refuses_with_1013_and_never_calls_the_handler(tmp_path, reads, n0, monkeypatch):
+    from gateway import run_idle_exit
+    home, _auth, runner, handled, sent, start = _attach_world(tmp_path, monkeypatch)
+    gate = _HopGate(monkeypatch)
+    task = start()
+    await gate.wait_entered()
+    assert run_idle_exit._client_busy(runner, window=0.0) == "1 client(s) attached"  # counted through the hop
+    runner._draining = True  # a drain that begins while the profile read is in flight
+    gate.release.set()
+    await task
+    assert handled == []
+    assert sent[-1] == {"type": "websocket.close", "code": 1013, "reason": ""}
+    assert _bound()["home"] != str(home)
