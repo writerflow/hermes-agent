@@ -3,11 +3,72 @@
 import json
 import os
 import subprocess
+from pathlib import Path
 
 import pytest
 
-from hermes_cli import update_cmd_commit, update_cmd_posix_pause as pause
+from hermes_cli import update_abort_recovery, update_cmd_commit, update_cmd_posix_pause as pause
 from tools import process_registry, work_scope
+
+
+@pytest.mark.platforms("linux")
+@pytest.mark.parametrize("case", ["verified", "wrong policy", "wrong invocation", "missing invocation"])
+def test_abort_recovery_checks_the_scope_before_starting_the_worker(monkeypatch, tmp_path, case):
+    monkeypatch.setattr(update_abort_recovery.shutil, "which", lambda name: "/usr/bin/systemd-run")
+    monkeypatch.setenv("INVOCATION_ID", "not-the-new-scope")
+    monkeypatch.setattr(process_registry, "systemd_user_bus_env", lambda env: {
+        **env, "DBUS_SESSION_BUS_ADDRESS": "unix:path=/fixture/bus",
+    })
+    seen = []
+    started = []
+    invocation = b"\x01" * 16
+    scope = work_scope.ScopeBus.__new__(work_scope.ScopeBus)
+    verified = []
+    monkeypatch.setattr(scope, "verify_owner", lambda: verified.append("owner"))
+    monkeypatch.setattr(scope, "scope_identity", lambda name, membership: ("/fixture", invocation))
+    monkeypatch.setattr(scope, "property", lambda *args: "stop" if case == "wrong policy" else "continue")
+    monkeypatch.setattr(work_scope, "ScopeBus", lambda route, deadline: scope)
+    monkeypatch.setattr(work_scope, "_CGROUP_ROOT", tmp_path)
+
+    def exec_worker(path, argv, env):
+        assert verified == ["owner"]
+        started.append(argv)
+
+    monkeypatch.setattr(work_scope.os, "execvpe", exec_worker)
+
+    def manager(argv, **kwargs):
+        separator = argv.index("--")
+        wrapper, launch = argv[:separator], argv[separator + 1:]
+        assert "OOMPolicy=continue" in wrapper
+        name = wrapper[wrapper.index("--unit") + 1]
+        assert launch[3] == name
+        assert "INVOCATION_ID" not in kwargs["env"]
+        seen.append(json.loads(kwargs["input"]))
+        target = tmp_path / name
+        target.mkdir()
+        (target / "cgroup.procs").write_text(f"{os.getpid()}\n", encoding="ascii")
+        read_text = Path.read_text
+        def read_membership(path, **options):
+            return f"0::/{name}\n" if path == Path("/proc/self/cgroup") else read_text(path, **options)
+
+        monkeypatch.setattr(Path, "read_text", read_membership)
+        if case == "missing invocation":
+            monkeypatch.delenv("INVOCATION_ID")
+        else:
+            monkeypatch.setenv("INVOCATION_ID", "02" * 16 if case == "wrong invocation" else invocation.hex())
+        return subprocess.CompletedProcess(argv, work_scope._run_scope_launcher(name, launch[4:]), "", "")
+
+    monkeypatch.setattr(update_abort_recovery.subprocess, "run", manager)
+    result = update_abort_recovery._run_fresh_recovery_process(
+        ["fixture"], {"fixture": "systemd"}, gateway_mode=True, recover_serve=False, skip_units=[],
+    )
+    assert result is not None
+    assert result.returncode == (0 if case == "verified" else 1)
+    request, = seen
+    assert request["profiles"] == ["fixture"]
+    assert [argv[1:] for argv in started] == (
+        [["-m", "hermes_cli.update_restart_recovery", "--stdin"]] if case == "verified" else []
+    )
 
 
 @pytest.mark.platforms("linux")

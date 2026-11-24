@@ -91,7 +91,7 @@ class ScopeBus:
             raise ScopeVerificationError("systemd scope was not active")
         return path, bytes(invocation)
 
-    def verify_scope(self, name: str, membership: str) -> None:
+    def verify_scope(self, name: str, membership: str, *, expected_invocation: str | None = None) -> None:
         """Check the current process and the manager against the same cgroup."""
         parts = membership.split("/")
         if parts[0] != "" or any(part in {"", ".", ".."} for part in parts[1:]) or parts[-1] != name:
@@ -103,6 +103,8 @@ class ScopeBus:
             fd = os.open(directory, os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
             try:
                 path, invocation = self.scope_identity(name, membership)
+                if expected_invocation is not None and invocation.hex() != expected_invocation:
+                    raise ScopeVerificationError("systemd scope invocation did not match the launcher")
                 if self.property("s", path, SCOPE, "OOMPolicy") != OOM_POLICY:
                     raise ScopeVerificationError("systemd scope OOMPolicy did not equal continue")
                 if self.scope_identity(name, membership) != (path, invocation):
@@ -134,17 +136,29 @@ def probe_payload(name: str) -> list[str]:
     return [sys.executable, "-I", str(Path(__file__).resolve()), name]
 
 
-def _verify_inert_probe(name: str) -> int:
+def scoped_payload(name: str, command: list[str]) -> list[str]:
+    return [*probe_payload(name), *command]
+
+
+def _verify_scope_launch(name: str, *, expected_invocation: str | None = None) -> None:
+    lines = Path("/proc/self/cgroup").read_text(encoding="utf-8").splitlines()
+    membership = next((line[3:] for line in lines if line.startswith("0::")), "")
+    ScopeBus("--user", time.monotonic() + 2).verify_scope(
+        name, membership, expected_invocation=expected_invocation,
+    )
+
+
+def _run_scope_launcher(name: str, command: list[str]) -> int:
     try:
-        lines = Path("/proc/self/cgroup").read_text(encoding="utf-8").splitlines()
-        membership = next((line[3:] for line in lines if line.startswith("0::")), "")
-        if not membership or membership.rsplit("/", 1)[-1] != name:
-            return 1
-        ScopeBus("--user", time.monotonic() + 2).verify_scope(name, membership)
+        # systemd-run v255 waits for the create job and passes the invocation
+        # ID of its own unit. The caller clears any inherited ID before launch.
+        _verify_scope_launch(name, expected_invocation=os.environ.get("INVOCATION_ID", "") if command else None)
+        if command:
+            os.execvpe(command[0], command, os.environ)  # windows-footgun: ok — Linux systemd entry point
     except (ScopeVerificationError, OSError):
         return 1
     return 0
 
 
 if __name__ == "__main__":
-    sys.exit(_verify_inert_probe(sys.argv[1]) if len(sys.argv) == 2 else 1)
+    sys.exit(_run_scope_launcher(sys.argv[1], sys.argv[2:]) if len(sys.argv) >= 2 else 1)
