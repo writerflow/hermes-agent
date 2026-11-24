@@ -92,6 +92,7 @@ class ScopeBus:
         return path, bytes(invocation)
 
     def verify_scope(self, name: str, membership: str) -> None:
+        """Check the current process and the manager against the same cgroup."""
         parts = membership.split("/")
         if parts[0] != "" or any(part in {"", ".", ".."} for part in parts[1:]) or parts[-1] != name:
             raise ScopeVerificationError("invalid cgroup path for scope policy readback")
@@ -109,10 +110,24 @@ class ScopeBus:
                 self.verify_owner()
                 if not os.path.samestat(os.fstat(fd), directory.stat(follow_symlinks=False)):
                     raise ScopeVerificationError("systemd scope cgroup changed during OOMPolicy verification")
+                _verify_self_in_cgroup(fd)
             finally:
                 os.close(fd)
         except OSError as exc:
             raise ScopeVerificationError("systemd scope cgroup identity was unreadable") from exc
+
+
+def _verify_self_in_cgroup(directory_fd: int) -> None:
+    # A path string from /proc/self/cgroup doesn't establish which directory
+    # contained us. Read membership relative to the object we verified.
+    fd = os.open("cgroup.procs", os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=directory_fd)
+    try:
+        pid = f"{os.getpid()}\n".encode("ascii")
+        with open(fd, "rb", closefd=False) as members:
+            if not any(line == pid for line in members):
+                raise ScopeVerificationError("current process was not in the verified scope")
+    finally:
+        os.close(fd)
 
 
 def probe_payload(name: str) -> list[str]:

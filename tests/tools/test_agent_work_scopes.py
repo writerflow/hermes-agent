@@ -55,7 +55,10 @@ def test_retained_dispatch_refuses_if_scope_helper_disappears_after_probe(monkey
 
 @pytest.mark.platforms("linux")
 @pytest.mark.parametrize("bus, scope", [("--user", "user"), ("--system", "system")])
-@pytest.mark.parametrize("policy", ["continue", "stop", "kill", "changed invocation", "replaced cgroup", None])
+@pytest.mark.parametrize("policy", [
+    "continue", "stop", "kill", "changed invocation", "replaced cgroup",
+    "missing member", "unreadable membership", None,
+])
 def test_escape_checks_policy_before_update_can_switch(monkeypatch, tmp_path, bus, scope, policy):
     original = "/hermes-gateway.service"
     action = []
@@ -93,7 +96,11 @@ def test_escape_checks_policy_before_update_can_switch(monkeypatch, tmp_path, bu
             args = argv[argv.index("StartTransientUnit") + 2:]
             requested.append(args)
             moved_to.append("/app.slice/" + args[0])
-            (cgroup_root / moved_to[0][1:]).mkdir(parents=True)
+            target = cgroup_root / moved_to[0][1:]
+            target.mkdir(parents=True)
+            if policy != "unreadable membership":
+                membership = "" if policy == "missing member" else f"{os.getpid()}\n"
+                (target / "cgroup.procs").write_text(membership, encoding="ascii")
             data = {"type": "o", "data": ["/org/freedesktop/systemd1/job/42"]}
         elif "GetUnit" in argv:
             data = {"type": "o", "data": ["/org/freedesktop/systemd1/unit/fixture"]}
@@ -108,7 +115,9 @@ def test_escape_checks_policy_before_update_can_switch(monkeypatch, tmp_path, bu
                 target = cgroup_root / moved_to[0][1:]
                 target.rename(target.with_name("original.scope"))
                 target.mkdir()
-            value = "continue" if policy in {"changed invocation", "replaced cgroup"} else policy
+            value = "continue" if policy in {
+                "changed invocation", "replaced cgroup", "missing member", "unreadable membership",
+            } else policy
             data = {"type": "s", "data": value}
         return subprocess.CompletedProcess(argv, 0 if data else 1, json.dumps(data), "")
 
