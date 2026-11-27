@@ -20,10 +20,14 @@ def test_cron_create_other_reads_are_off_loop(mux, monkeypatch, site):
         job = jobs.create_job(prompt='report', schedule='every 1h', deliver='local', model='fixture')
     observed = []
     if site == 'session':
+        from gateway.session_local_recovery import local_identity
+        from hermes_state_keys import CRON_PRINCIPAL_ID, cron_request_id
+        expected_sid = local_identity(authority.profile_id, CRON_PRINCIPAL_ID,
+                                      cron_request_id(job['id'], 'fresh'))
         real = authority.db._read_one
         def probe(sql, params=()):
-            # Capture the initial identity query, not later owner-side restore reads.
-            if not observed and 'FROM sessions' in sql:
+            # Capture the initial query for this identity, not later restore reads.
+            if not observed and 'FROM sessions' in sql and expected_sid in params:
                 observed.append((Path(authority.db.db_path).resolve().parent, threading.get_ident()))
             return real(sql, params)
         monkeypatch.setattr(authority.db, '_read_one', probe)
