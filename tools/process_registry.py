@@ -565,6 +565,7 @@ class ProcessSession:
     detached: bool = False                      # Recovered from checkpoint (no pipe)
     pid_scope: str = "host"                     # "host" for local/PTY PIDs, "sandbox" for env-local PIDs
     systemd_unit: str = ""                      # transient scope unit name when spawned under systemd-run
+    original_scope_required: bool = False       # a yielded foreground scope cannot be stopped from checkpoint metadata
     wsl_chain: bool = False                     # spawned via wsl[.exe]: the host PID is the short-lived
                                                 # launcher; Linux-side workers outlive it (#120546)
     handoff_note: str = ""                      # why a subagent handed this process to its parent (rides the notice)
@@ -658,7 +659,7 @@ _CHECKPOINT_FIELDS = (
     "started_at", "task_id", "owner_task_id", "session_key",
     *(f"watcher_{k}" for k in _WATCHER_ROUTE_KEYS), "watcher_interval",
     "parent_session_id", "notify_on_complete", "completion_output_chars", "watch_patterns",
-    "heartbeat_seconds", "persist_on_release", "output_log")
+    "heartbeat_seconds", "persist_on_release", "output_log", "original_scope_required")
 _CHECKPOINT_DEFAULTS = {
     f.name: ([] if f.name == "watch_patterns" else f.default)
     for f in ProcessSession.__dataclass_fields__.values()
@@ -1262,6 +1263,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
         if output_so_far:
             session.append_output(output_so_far)
         scoped = getattr(proc, "_hermes_scope_admission", None) is not None
+        session.original_scope_required = scoped
         if scoped:
             setattr(proc, "_hermes_scope_adopted", True)
         try:
@@ -2141,6 +2143,9 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
             return _not_found(session_id)
         proc = session.process
         scoped_handoff = proc is not None and getattr(proc, "_hermes_scope_adopted", False)
+        if session.original_scope_required and not scoped_handoff:
+            return {"status": "error", "error": "Cleanup incomplete: original scope handle unavailable",
+                    "session_id": session.id}
         was_exited = session.exited
         if proc is not None and scoped_handoff:
             from tools.environments.local import _kill_process_group_posix
