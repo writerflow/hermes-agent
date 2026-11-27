@@ -38,6 +38,7 @@ _log = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from hermes_cli.kanban_db import Task
+    from tools.process_registry import GatewayChildDispatch
 
 
 # After this many consecutive non-success attempts on a task/profile the
@@ -2334,7 +2335,7 @@ def _open_worker_log(task: Task, board: Optional[str]):
     return open_worker_log(log_path)
 
 
-def _restart_safe_worker_argv(task: Task, command: list[str]) -> list[str]:
+def _restart_safe_worker_argv(task: Task, command: list[str]) -> GatewayChildDispatch:
     """Wrap a systemd-hosted dispatcher's worker in the shared restart-safe scope.
 
     Kanban workers are long-lived agentic runs that outlive the dispatcher
@@ -2362,14 +2363,14 @@ def _restart_safe_worker_argv(task: Task, command: list[str]) -> list[str]:
                 "cannot create restart-safe systemd scope for Kanban worker: "
                 "the claimed task has no current run id"
             )
-        return command
+        return dispatch
 
     return restart_safe_gateway_child_argv(
         command,
         unit_suffix=f"kanban-{task.id}-run-{task.current_run_id}",
         require_restart_safe_scope=True,
         outlives_parent=True,
-    ).argv
+    )
 
 
 def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -> Optional[int]:
@@ -2490,13 +2491,13 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
     # A worker spawned by a managed systemd gateway must leave the gateway's
     # cgroup before startup; otherwise restarting the service kills the worker
     # that is performing the handoff.
-    cmd = _restart_safe_worker_argv(task, cmd)
+    dispatch = _restart_safe_worker_argv(task, cmd)
     from tools.process_registry import systemd_user_bus_env
     env = systemd_user_bus_env(env)
     log_f = _open_worker_log(task, board)
     try:
-        proc = subprocess.Popen(
-            cmd,
+        proc = dispatch.spawn(
+            subprocess.Popen,
             cwd=workspace if os.path.isdir(workspace) else None,
             stdin=subprocess.DEVNULL,
             stdout=log_f,
@@ -2506,13 +2507,13 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
             creationflags=subprocess.CREATE_NO_WINDOW if _kb._IS_WINDOWS else 0,
         )
     except FileNotFoundError:
-        log_f.close()
         raise RuntimeError(
             "`hermes` executable not found on PATH. "
             "Install Hermes Agent or activate its venv before running the kanban dispatcher."
         )
-    # Intentionally NOT closing log_f: the child keeps writing after return;
-    # the OS-level FD stays open in the child until it exits.
+    finally:
+        # The child owns its copy once Popen succeeds.
+        log_f.close()
     if _kb._IS_WINDOWS:
         _live_worker_procs[proc.pid] = proc
     return proc.pid

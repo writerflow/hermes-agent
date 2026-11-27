@@ -389,6 +389,32 @@ class GatewayChildDispatch(NamedTuple):
     mode: Literal["in_process", "scoped", "degraded"]
     argv: list[str]
 
+    def spawn(self, popen, *, env: dict[str, str], **kwargs):
+        if self.mode != "scoped":
+            return popen(self.argv, env=env, **kwargs)
+
+        try:
+            separator = self.argv.index("--")
+            unit = self.argv[self.argv.index("--unit") + 1] + ".scope"
+            scoped_env = dict(env)
+            scoped_env.pop("INVOCATION_ID", None)
+            owner, launcher = socket.socketpair()
+            with owner, launcher:
+                argv = [
+                    *self.argv[:separator], "--property", f"OOMPolicy={OOM_POLICY}", "--",
+                    *held_scope_payload(unit, launcher.fileno(), self.argv[separator + 1:]),
+                ]
+                owner.settimeout(3)
+                proc = popen(argv, env=scoped_env, pass_fds=(launcher.fileno(),), **kwargs)
+                launcher.close()
+                if owner.recv(1) != b"V":
+                    raise OSError("launcher did not confirm placement")
+                owner.sendall(b"R")
+                return proc
+        except (ValueError, IndexError, OSError) as exc:
+            # Do not stop a unit by name or launch another worker after an uncertain move.
+            raise RestartSafeScopeUnavailable("restart-safe systemd scope placement was not verified") from exc
+
 
 def scoped_spawn_lost_user_bus(spawn_env: dict[str, str]) -> bool:
     """After a ``systemd-run --user --scope`` wrapper exits before its child could start: True
