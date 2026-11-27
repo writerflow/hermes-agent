@@ -96,6 +96,40 @@ def test_cron_create_exact_retry_reads_identity_off_loop_without_job(mux, monkey
     assert all(ident != loop_ident for ident in reads), 'exact retry identity read on owner loop'
 
 
+def test_cron_create_fences_independent_writer_at_binding(mux, monkeypatch):
+    import sqlite3
+    from cron import jobs
+    from gateway import session_cron, session_policy
+
+    runner, homes, loop, call = mux
+    authority = runner.session_authorities.require(homes['beta'])
+    with jobs.use_cron_store(homes['beta']):
+        job = jobs.create_job(prompt='report', schedule='every 1h', deliver='local', model='fixture')
+    real = session_policy.bind_launch_key
+    attempts = []
+
+    def probe(*args, **kwargs):
+        # An independent writer must not commit between the absence decision and
+        # its memory publication. A zero-timeout BEGIN makes that ordering visible.
+        with sqlite3.connect(authority.db.db_path, timeout=0) as writer:
+            try:
+                writer.execute('BEGIN IMMEDIATE')
+            except sqlite3.OperationalError as exc:
+                assert 'locked' in str(exc)
+                attempts.append('excluded')
+            else:
+                attempts.append('acquired')
+                writer.rollback()
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(session_policy, 'bind_launch_key', probe)
+    result = call(session_cron.operation(authority, 'submit', {
+        'job_id': job['id'], 'request_id': 'writer-race', 'extra_prompt': None}))
+    assert authority.db.get_session(result['session_id']) is not None
+    assert attempts, 'cron submit did not reach launch-key binding'
+    assert attempts == ['excluded'], f'independent writer entered before binding: {attempts}'
+
+
 def test_cron_create_refuses_drain_during_job_read(mux, monkeypatch):
     from cron import jobs
     from gateway import session_cron
