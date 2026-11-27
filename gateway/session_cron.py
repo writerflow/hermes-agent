@@ -120,13 +120,19 @@ async def _create(authority, actor, params):
     execution_id, request_id = request_id, cron_request_id(jid, request_id)
     sid = local_identity(authority.profile_id, actor.subject, request_id)
     db, epoch = authority.db, authority.epoch
+    registry = getattr(authority.runner, 'session_authorities', None)
+    if registry is not None:
+        from hermes_constants import hermes_home_key
+        registry_key = hermes_home_key(authority.profile_id)
+    else:
+        registry_key = None
 
     def check_current():
         require_serving(authority)
         authority._require_admission_open()
-        registry = getattr(authority.runner, 'session_authorities', None)
         if (authority.db is not db or authority.epoch != epoch
-                or (registry is not None and registry.for_home(authority.profile_id) is not authority)):
+                or getattr(authority.runner, 'session_authorities', None) is not registry
+                or (registry is not None and registry._by_key.get(registry_key) is not authority)):
             raise RuntimeStoreError('runtime_draining')
 
     def read_existing():
@@ -218,11 +224,14 @@ async def _create(authority, actor, params):
     read_task = track_mutation(authority, asyncio.to_thread(prepare))
     policy, private = await asyncio.shield(read_task)
     check_current()
+    # Resolve the owner profile and route before acquiring the database guard:
+    # both helpers may perform filesystem lookups on a cold cache.
+    from gateway.session_local_recovery import local_source
+    source = local_source(authority, sid, actor.subject)
+    route = authority.runner.session_store._generate_session_key(source)
+
     def stage_absent():
         bound = bind_launch_key(authority, sid, policy, None, config_secrets=private)
-        from gateway.session_local_recovery import local_source
-        source = local_source(authority, sid, actor.subject)
-        route = authority.runner.session_store._generate_session_key(source)
         now = _now()
         entry = SessionEntry(route, sid, now, now, origin=source, platform=Platform.LOCAL)
         # The receipt is committed separately by operation('submit').
