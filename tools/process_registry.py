@@ -2139,7 +2139,19 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
         session = self.get(session_id)
         if session is None:
             return _not_found(session_id)
-        if session.exited:
+        proc = session.process
+        scoped_handoff = proc is not None and getattr(proc, "_hermes_scope_adopted", False)
+        was_exited = session.exited
+        if proc is not None and scoped_handoff:
+            from tools.environments.local import _kill_process_group_posix
+            from tools.foreground_scope import stop_adopted_scope
+
+            reason = stop_adopted_scope(
+                proc, lambda: _kill_process_group_posix(proc, sweep_detached=False) if proc.poll() is None else None)
+            if reason is not None:
+                return {"status": "error", "error": f"Cleanup incomplete: {reason}",
+                        "session_id": session.id, "process_running": proc.poll() is None}
+        if was_exited:
             # A double-forked descendant may still be alive in the systemd scope even
             # though the main process exited — stop the scope to reap survivors.
             # See #70716.
@@ -2148,7 +2160,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
             # above (reviewer gap #2). ``systemctl --user stop`` sends SIGTERM to every process in the
             # cgroup and escalates to SIGKILL after TimeoutStopSec. This is additive — the PID-based kill
             # above already handled the main process; this catches stragglers.
-            scope_stopped = self._stop_scope(session)
+            scope_stopped = scoped_handoff or self._stop_scope(session)
             with session._lock:
                 result = self._exit_snapshot(session, "already_exited")
                 finalizing = self._reader_finalizing(session)
@@ -2160,12 +2172,12 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
                 self._completion_consumed.add(session.id)
             return result
         try:
-            early = self._signal_kill(session, consume_output)
+            early = None if scoped_handoff else self._signal_kill(session, consume_output)
             if early is not None:
                 return early
             # Additive to the PID kill: stopping the scope reaps double-forked
             # descendants reparented inside the cgroup.
-            scope_stopped = self._stop_scope(session)
+            scope_stopped = scoped_handoff or self._stop_scope(session)
             # Post-kill verification (#115490): the signals above can leave
             # survivors (SIGTERM-ignoring daemons, scope escapees). A kill that
             # leaves a live tree must not write a killed receipt or prune the

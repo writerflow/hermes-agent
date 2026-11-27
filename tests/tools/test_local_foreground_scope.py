@@ -857,9 +857,9 @@ class TestScopeLifecycle:
         assert any("cleanup incomplete: original scope still populated" in report for report in reports) == populated
 
     @pytest.mark.parametrize("member_owned", [True, False])
-    @pytest.mark.parametrize("force", [False, True], ids=["timeout", "hard-exit"])
+    @pytest.mark.parametrize("route", ["timeout", "hard-exit", "yield-stop"])
     def test_cleanup_checks_frozen_recursive_members_before_stopping_original(
-        self, member_owned, force, worker_host, fg_config, stub, make_env, monkeypatch, tmp_path, caplog,
+        self, member_owned, route, worker_host, fg_config, stub, make_env, monkeypatch, tmp_path, caplog,
     ):
         fg_config()
         stopped = self._spy_stop(monkeypatch)
@@ -909,7 +909,24 @@ class TestScopeLifecycle:
         monkeypatch.setattr(fs, "_pin_original", pin_original)
         env = make_env()
         command = f"touch '{marker}'; exec sleep 30"
-        if force:
+        if route == "yield-stop":
+            from tools.environments import base
+            from tools.terminal_tool_background import yield_to_background_handler
+
+            monkeypatch.setattr(base, "consume_yield", lambda _: marker.is_file())
+            handler = yield_to_background_handler(
+                command=command, env_type="local", cwd=None, effective_task_id="fg-scope-stop",
+                task_id="fg-scope-stop", session_key="")
+            proc = env._run_bash(command, resource_scope=True)
+            try:
+                yielded = env._wait_for_process(proc, timeout=5, yield_handler=handler)
+                result = pr.process_registry.kill_process(yielded["yielded_session_id"])
+                assert (original / "cgroup.kill").read_bytes() == (b"1" if member_owned else b"")
+                assert result["status"] == ("killed" if member_owned else "error"), result
+            finally:
+                proc.kill()
+                proc.wait(timeout=5)
+        elif route == "hard-exit":
             from tests.waiting import wait_until
             from tools.environments import base
 

@@ -29,7 +29,7 @@ import uuid
 from contextlib import ExitStack, suppress
 from dataclasses import dataclass
 from threading import Lock
-from typing import BinaryIO, Mapping
+from typing import BinaryIO, Callable, Mapping
 
 from agent.memory_provider import spawn_context_thread
 from hermes_cli._subprocess_compat import process_start_time_stdlib
@@ -481,6 +481,7 @@ class _HeldAdmission:
         self._fence = Lock()
         self._closed = False
         self._original: _PinnedScope | None = None
+        self._drained = False
 
     def verify_and_release(self, proc: subprocess.Popen, unit: str) -> None:
         try:
@@ -536,13 +537,23 @@ class _HeldAdmission:
                 self._original.close()
                 self._original = None
 
-    def cleanup_original(self, unit: str, *, timeout: float) -> None:
+    def cleanup_original(self, unit: str, *, timeout: float,
+                         prepare: Callable[[], None] | None = None) -> str | None:
         with self._fence:
+            if self._drained:
+                return None
             if self._original is None:
-                return
+                return "original scope unavailable" if prepare is not None else None
+            if prepare is not None:
+                # The reader can reap the launcher during cooperative shutdown,
+                # but must not close the pin until this explicit stop has used it.
+                with suppress(OSError):
+                    prepare()
             reason = self._original.drain(timeout=timeout)
+            self._drained = reason is None
         if reason is not None:
             logger.warning("Foreground scope %s: cleanup incomplete: %s", unit, reason)
+        return reason
 
 
 def foreground_scope_host() -> bool:
@@ -662,6 +673,12 @@ def cancel_admission(proc: object) -> bool:
 def cleanup_original(proc: object, *, timeout: float = _CLEANUP_TIMEOUT) -> None:
     if (admission := getattr(proc, "_hermes_scope_admission", None)) is not None:
         admission.cleanup_original(scope_unit_of(proc), timeout=timeout)
+
+
+def stop_adopted_scope(proc: subprocess.Popen, prepare: Callable[[], None]) -> str | None:
+    admission: _HeldAdmission = getattr(proc, "_hermes_scope_admission")
+    admission.cancel()
+    return admission.cleanup_original(scope_unit_of(proc), timeout=_CLEANUP_TIMEOUT, prepare=prepare)
 
 
 def wrapper_diagnostic(proc: subprocess.Popen, returncode: int | None) -> tuple[str, bool]:
