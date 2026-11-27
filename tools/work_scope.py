@@ -145,6 +145,25 @@ def held_scope_payload(name: str, control_fd: int, command: list[str]) -> list[s
     return [*probe_payload(name), "--control-fd", str(control_fd), *command]
 
 
+def before_scope_payload(control_fd: int, command: list[str]) -> list[str]:
+    return [*probe_payload("--before-scope"), str(control_fd), *command]
+
+
+def _run_before_scope(control_fd: int, command: list[str]) -> int:
+    try:
+        with socket.socket(fileno=control_fd) as control:
+            control.settimeout(3)
+            control.sendall(b"P")
+            if control.recv(1) != b"S":
+                return 1
+            # Keep the same PID and private socket through systemd-run and
+            # on to the post-placement launcher. That launcher closes it.
+            os.execvpe(command[0], command, os.environ)  # windows-footgun: ok — Linux systemd entry point
+    except OSError:
+        return 1
+    return 1
+
+
 def _verify_scope_launch(name: str, *, expected_invocation: str | None = None) -> None:
     lines = Path("/proc/self/cgroup").read_text(encoding="utf-8").splitlines()
     membership = next((line[3:] for line in lines if line.startswith("0::")), "")
@@ -177,4 +196,6 @@ def _run_scope_launcher(name: str, command: list[str]) -> int:
 
 
 if __name__ == "__main__":
+    if len(sys.argv) >= 4 and sys.argv[1] == "--before-scope":
+        sys.exit(_run_before_scope(int(sys.argv[2]), sys.argv[3:]))
     sys.exit(_run_scope_launcher(sys.argv[1], sys.argv[2:]) if len(sys.argv) >= 2 else 1)

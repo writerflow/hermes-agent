@@ -47,7 +47,8 @@ from tools.process_registry_results import load_completed_results, save_complete
 from tools.process_registry_env_log import fallback_exit_code, log_delta_command, parse_log_delta_reply
 from tools.process_registry_wsl import _is_wsl_launcher_command
 from tools.process_registry_wait import max_wait_timeout, process_deadline_floor
-from tools.work_scope import OOM_POLICY, ScopeProbeFailure, held_scope_payload, probe_payload
+from tools.work_scope import OOM_POLICY, ScopeProbeFailure, before_scope_payload, held_scope_payload, probe_payload
+from tools.work_scope_placement import record_background_intent
 
 logger = logging.getLogger(__name__)
 
@@ -1159,8 +1160,13 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
                 )
                 scoped[1:1] = ["--property", f"OOMPolicy={OOM_POLICY}"]
                 owner.settimeout(3)
-                proc = spawn(scoped, env=env, pass_fds=(launcher.fileno(),), **kwargs)
+                pending = before_scope_payload(launcher.fileno(), scoped)
+                proc = spawn(pending, env=env, pass_fds=(launcher.fileno(),), **kwargs)
                 launcher.close()
+                if owner.recv(1) != b"P":
+                    raise OSError("launcher did not reach the request gate")
+                record_background_intent(proc.pid, name, session.id)
+                owner.sendall(b"S")
                 if owner.recv(1) != b"V":
                     raise OSError("launcher did not confirm placement")
                 owner.sendall(b"R")

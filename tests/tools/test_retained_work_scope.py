@@ -1,5 +1,6 @@
 """Exercise real pipe and PTY children with a substituted scope manager."""
 
+import json
 import os
 import shlex
 import shutil
@@ -13,8 +14,13 @@ from tools import process_registry, work_scope
 
 @pytest.mark.platforms("linux")
 @pytest.mark.parametrize("use_pty", [False, True], ids=["pipe", "pty"])
-@pytest.mark.parametrize("verified", [False, True], ids=["refused", "admitted"])
-def test_background_payload_waits_for_scope_verification(monkeypatch, tmp_path, use_pty, verified):
+@pytest.mark.parametrize("outcome", ["refused", "admitted", "write failed"])
+def test_background_payload_waits_for_scope_verification(monkeypatch, tmp_path, use_pty, outcome):
+    verified = outcome == "admitted"
+    placement_dir = tmp_path / "work-scope-placements"
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    if outcome == "write failed":
+        placement_dir.write_text("not a directory")
     marker = tmp_path / "payload"
     manager_log = tmp_path / "manager"
     manager = tmp_path / "systemd-run"
@@ -27,6 +33,16 @@ from pathlib import Path
 options, command = sys.argv[1:sys.argv.index('--')], sys.argv[sys.argv.index('--') + 1:]
 log = Path({str(manager_log)!r})
 log.write_text('requested\\n' if 'OOMPolicy=continue' in options else 'missing policy\\n')
+if {outcome != 'write failed'!r}:
+    import json
+    record_file, = Path({str(placement_dir)!r}).glob('*.json')
+    receipt = json.loads(record_file.read_text())
+    assert receipt['state'] == 'unresolved'
+    assert receipt['pid'] == os.getpid()
+    assert receipt['start_time'] == int(Path('/proc/self/stat').read_text().rsplit(')', 1)[1].split()[19])
+    assert receipt['unit'] == options[options.index('--unit') + 1] + '.scope'
+    with log.open('a') as stream:
+        stream.write('intent found\\n')
 if len(command) > 2 and command[2] == {str(Path(work_scope.__file__).resolve())!r}:
     entry = runpy.run_path(command[2])['_run_scope_launcher']
     def verify(*args, **kwargs):
@@ -71,5 +87,14 @@ os.execv(command[0], command)
             pytest.fail("launch did not report the refusal")
         assert not marker.exists()
         assert not registry._running
-    assert manager_log.read_text() == "requested\nchecked\n"
+    if outcome == "write failed":
+        assert not manager_log.exists(), "manager was called without a placement record"
+    else:
+        assert manager_log.read_text() == "requested\nintent found\nchecked\n"
+        record_file, = placement_dir.glob("*.json")
+        receipt = json.loads(record_file.read_text())
+        assert receipt["attempt_id"] == record_file.stem
+        assert receipt["version"] == 1
+        assert receipt["state"] == "unresolved"
+        assert record_file.stat().st_mode & 0o777 == 0o600
     assert not stops

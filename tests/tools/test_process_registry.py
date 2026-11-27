@@ -2017,9 +2017,10 @@ class TestSystemdCgroupIsolation:
         # These tests replace the process itself. The real child handshake is
         # exercised separately in test_retained_work_scope.py.
         owner, launcher = MagicMock(), MagicMock()
-        owner.recv.return_value = b"V"
+        owner.recv.side_effect = [b"P", b"V"]
         launcher.fileno.return_value = 12
         monkeypatch.setattr("tools.process_registry.socket.socketpair", lambda: (owner, launcher))
+        monkeypatch.setattr("tools.process_registry.record_background_intent", lambda *args: None)
 
     @pytest.mark.platforms("linux")
     def test_wraps_in_systemd_scope_when_supervisor_and_available(
@@ -2048,7 +2049,7 @@ class TestSystemdCgroupIsolation:
         ):
             session = registry.spawn_local("echo hello", cwd="/tmp")
 
-        argv = captured["argv"]
+        argv = captured["argv"][5:]  # after the held starter
         assert argv[0] == "/usr/bin/systemd-run", argv
         assert "--user" in argv
         assert "--scope" in argv
@@ -2295,7 +2296,7 @@ class TestSystemdCgroupIsolation:
             patch.object(registry, "_write_checkpoint"):
             session = registry.spawn_local("codex", cwd="/tmp", use_pty=True)
 
-        argv = pty_spawn.call_args.args[0]
+        argv = pty_spawn.call_args.args[0][5:]  # after the held starter
         assert argv[0] == "/usr/bin/systemd-run"
         assert "--scope" in argv
         assert "--unit" in argv
