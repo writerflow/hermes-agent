@@ -130,6 +130,44 @@ def test_cron_create_fences_independent_writer_at_binding(mux, monkeypatch):
     assert attempts == ['excluded'], f'independent writer entered before binding: {attempts}'
 
 
+def test_cron_create_editor_discovery_never_holds_db_writer_guard(mux, monkeypatch):
+    import sqlite3
+    from cron import jobs
+    from gateway import session_cron, session_local_mcp, session_policy
+
+    runner, homes, loop, call = mux
+    authority = runner.session_authorities.require(homes['beta'])
+    with jobs.use_cron_store(homes['beta']):
+        job = jobs.create_job(prompt='report', schedule='every 1h', deliver='local', model='fixture')
+    build = session_policy.build_policy
+    observations = []
+
+    def prepare_with_editor(*args, **kwargs):
+        result = build(*args, **kwargs)
+        kwargs['private_secrets'][session_local_mcp.PRIVATE_KEY] = [{'name': 'fixture'}]
+        return result
+
+    def discovery_probe(owner, sid, policy, servers):
+        assert servers, 'editor discovery was not reached'
+        with sqlite3.connect(authority.db.db_path, timeout=0) as writer:
+            try:
+                writer.execute('BEGIN IMMEDIATE')
+            except sqlite3.OperationalError as exc:
+                assert 'locked' in str(exc)
+                observations.append('guard-held')
+            else:
+                observations.append('guard-free')
+                writer.rollback()
+        return policy
+
+    monkeypatch.setattr(session_policy, 'build_policy', prepare_with_editor)
+    monkeypatch.setattr(session_local_mcp, 'bind_editor_mcp', discovery_probe)
+    result = call(session_cron.operation(authority, 'submit', {
+        'job_id': job['id'], 'request_id': 'editor-guard', 'extra_prompt': None}))
+    assert authority.db.get_session(result['session_id']) is not None
+    assert observations == ['guard-free'], observations
+
+
 def test_cron_create_refuses_drain_during_job_read(mux, monkeypatch):
     from cron import jobs
     from gateway import session_cron
