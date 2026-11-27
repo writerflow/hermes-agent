@@ -28,11 +28,11 @@ def test_cron_create_other_reads_are_off_loop(mux, monkeypatch, site):
         monkeypatch.setattr(authority.db, 'get_session', probe)
     else:
         real = run._load_gateway_config
-        def probe(config_path=None):
+        def config_probe(config_path=None):
             home = Path(config_path).parent if config_path is not None else run._gateway_config_home()
             observed.append((Path(home).resolve(), threading.get_ident()))
             return real(config_path)
-        monkeypatch.setattr(run, '_load_gateway_config', probe)
+        monkeypatch.setattr(run, '_load_gateway_config', config_probe)
 
     async def loop_thread():
         return threading.get_ident()
