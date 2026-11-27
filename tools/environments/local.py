@@ -1265,6 +1265,8 @@ class LocalEnvironment(BaseEnvironment):
             # platform, macOS included.
             from gateway.status import get_process_start_time
             proc._hermes_pgid_start = get_process_start_time(proc.pid)
+        if scoped is not None:
+            foreground_scope.start_admission(proc, scoped.unit)
         if stdin_data is not None:
             _pipe_stdin(proc, stdin_data)
         return proc
@@ -1318,6 +1320,7 @@ class LocalEnvironment(BaseEnvironment):
 
     def _kill_process(self, proc):
         """Kill the owned process tree; a requested scope name confers no cleanup authority."""
+        foreground_scope.cancel_admission(proc)
         try:
             (_kill_process_windows if _IS_WINDOWS else _kill_process_group_posix)(proc)
         except OSError:  # ProcessLookupError / PermissionError included
@@ -1333,6 +1336,7 @@ class LocalEnvironment(BaseEnvironment):
 
     def _force_kill_process(self, proc):
         """SIGKILL the whole group with no TERM grace or wait: the caller os._exit()s next."""
+        foreground_scope.cancel_admission(proc)
         if _IS_WINDOWS:  # already a forced tree kill
             return self._kill_process(proc)
         with contextlib.suppress(OSError):

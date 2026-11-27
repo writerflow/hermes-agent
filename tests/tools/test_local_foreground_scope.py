@@ -24,13 +24,17 @@ import subprocess
 import sys
 import textwrap
 import time
+from concurrent.futures import ThreadPoolExecutor
+from contextvars import copy_context
 from dataclasses import dataclass
 from pathlib import Path
+from threading import Event
 
 import pytest
 
 from tools import foreground_scope as fs
 from tools import process_registry as pr
+from tools.environments import local as local_env
 from tools.environments.local import LocalEnvironment
 
 pytestmark = pytest.mark.spawns_gateway_lookalike  # host shapes run real `gateway run` lookalike holders
@@ -71,14 +75,15 @@ class SystemdStub:
     SCRIPTS = {
         # run the wrapped command in place, as the real --scope mode does
         "passthrough": 'exec "${args[@]:$((sep+1))}"',
+        "unplaced": 'exec "${args[@]:$((sep+1))}"',
         # the bus is gone: the wrapper fails before the command could start
         "no_bus": 'echo "Failed to connect to bus: No such file or directory" >&2; exit 1',
         "lost_create_reply": 'echo "Failed to start transient scope unit: Connection timed out" >&2; exit 1',
         "unit_exists": 'echo "Failed to start transient scope unit: Unit already exists" >&2; exit 1',
         "multiline_create_error": ('echo "Failed to start transient scope unit: Connection dropped" >&2; '
                                    'echo "Failed to connect to bus: No such file or directory" >&2; exit 1'),
-        # the command did run, and the wrapper still reports failure
-        "ran_then_fail": '"${args[@]:$((sep+1))}"; exit 1',
+        # As with systemd-run, exec in place; the payload itself reports failure.
+        "ran_then_fail": 'args[-1]="trap \'exit 1\' EXIT; ${args[-1]}"; exec "${args[@]:$((sep+1))}"',
         "ran_then_bus_error": ('"${args[@]:$((sep+1))}"; '
                                'echo "Failed to connect to bus: No such file or directory" >&2; exit 1'),
     }
@@ -135,6 +140,8 @@ def stub_factory(tmp_path, monkeypatch):
         # Host capability, not identity: seed the probe's own cache instead of replacing the probe.
         monkeypatch.setattr(pr, "_SYSTEMD_SCOPE_AVAILABLE", True)
         monkeypatch.setattr(pr, "_SYSTEMD_SCOPE_PROBED_AT", time.monotonic())
+        if real is None and mode in ("passthrough", "ran_then_fail"):
+            monkeypatch.setattr(fs, "_pin_original", _fixture_pin)
         return stub
 
     return make
@@ -143,6 +150,17 @@ def stub_factory(tmp_path, monkeypatch):
 @pytest.fixture()
 def stub(stub_factory) -> SystemdStub:
     return stub_factory("passthrough")
+
+
+class _FixturePin:
+    def close(self):
+        pass
+
+
+def _fixture_pin(*_):
+    # These tests exercise behavior after admission. The pin-specific tests
+    # exercise actual directory/control opens with a simulated manager/kernel.
+    return _FixturePin()
 
 
 @pytest.fixture()
@@ -367,7 +385,10 @@ class TestScopedCommand:
     def test_gateway_command_is_scoped(self, fg_config, stub, tmp_path):
         fg_config()
         result = run_as_gateway(tmp_path, f"""
+            from tests.tools.test_local_foreground_scope import _fixture_pin
+            from tools import foreground_scope as fs
             from tools.environments.local import LocalEnvironment
+            fs._pin_original = _fixture_pin
             LocalEnvironment.init_session = lambda self, *a, **k: None
             env = LocalEnvironment(cwd={str(tmp_path)!r}, timeout=60)
             r = env.execute("echo hi", resource_scope=True)
@@ -538,15 +559,176 @@ class TestScopeLifecycle:
         assert result["output"].strip() == diagnostic
         assert len(stub.calls()) == 1
 
-    def test_launcher_bus_diagnostic_after_payload_does_not_replay(self, worker_host, fg_config,
-                                                                  stub_factory, make_env, tmp_path):
+    def test_launcher_bus_diagnostic_after_untrusted_helper_does_not_replay(self, worker_host, fg_config,
+                                                                          stub_factory, make_env, tmp_path):
         fg_config()
         stub = stub_factory("ran_then_bus_error")
         counter = tmp_path / "counter"
         result = make_env().execute(f"echo ran >> {counter}", resource_scope=True)
-        assert counter.read_text() == "ran\n"
+        # The helper has the wrong sender PID; neither admission nor replay is allowed.
+        assert not counter.exists()
         assert result["returncode"] == 1
         assert len(stub.calls()) == 1
+
+    def test_post_job_helper_without_scope_membership_cannot_run_payload(
+        self, worker_host, fg_config, stub_factory, make_env, monkeypatch, tmp_path,
+    ):
+        fg_config()
+        stub = stub_factory("unplaced")
+        # The pass-through launcher execs the helper with the right PID but
+        # never creates a cgroup or puts the helper into an original object.
+        stopped = self._spy_stop(monkeypatch)
+        marker = tmp_path / "payload"
+        result = make_env().execute(f"touch {marker}", resource_scope=True, timeout=5)
+        assert not marker.exists(), result
+        assert result["returncode"] == 125
+        assert len(stub.calls()) == 1
+        assert stopped == []
+
+    @pytest.mark.parametrize("cancel", [False, True], ids=["release-once", "cancel-before-release"])
+    def test_held_payload_waits_for_original_scope_verification(
+        self, cancel, worker_host, fg_config, stub, make_env, monkeypatch, tmp_path,
+    ):
+        fg_config()
+        marker = tmp_path / "payload"
+        verifying, finish_verification = Event(), Event()
+        stopped = self._spy_stop(monkeypatch)
+        held = []
+
+        class FixtureOriginal:
+            def close(self):
+                pass
+
+        def pin_original(proc, unit, invocation_id):
+            held.append(proc)
+            verifying.set()
+            assert finish_verification.wait(5), "verification barrier was not released"
+            return FixtureOriginal()
+
+        # Substitute only the manager/kernel object verification: run the actual
+        # launcher, helper, admission channel, and terminal waiter.
+        monkeypatch.setattr(fs, "_pin_original", pin_original)
+        env = make_env()
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            result = pool.submit(copy_context().run, env.execute, f"echo ran >> {marker}",
+                                 resource_scope=True, timeout=8)
+            try:
+                assert verifying.wait(5), (marker.exists(), result.result(timeout=10))
+                assert not marker.exists()
+                if cancel:
+                    # Force the cooperative PGID route to refuse. A rejected
+                    # group signal must not substitute for closing admission.
+                    monkeypatch.setattr(local_env, "_leader_is_ours", lambda *_: False)
+                    env._kill_process(held[0])
+            finally:
+                finish_verification.set()
+            reply = result.result(timeout=8)
+        if cancel:
+            assert not marker.exists(), reply
+            assert reply["returncode"] == 125
+        else:
+            assert marker.read_text() == "ran\n", reply
+            assert reply["returncode"] == 0
+        assert len(stub.calls()) == 1
+        assert stopped == []
+
+    @pytest.mark.parametrize("change", [None, "invocation", "membership", "generation", "control"])
+    def test_held_launch_pins_controls_only_for_the_original_placement(
+        self, change, worker_host, fg_config, stub_factory, make_env, monkeypatch, tmp_path,
+    ):
+        fg_config()
+        invocation = "12" * 16
+        monkeypatch.setitem(SystemdStub.SCRIPTS, "placed", f'export INVOCATION_ID={invocation}; '
+                            + SystemdStub.SCRIPTS["passthrough"])
+        stub_factory("placed")
+        mount = tmp_path / "cgroup"
+        mount.mkdir()
+        placements = []
+        marker = tmp_path / "payload"
+
+        def placement(pid, unit, env):
+            path = f"/app.slice/{unit}"
+            cg = mount / path.lstrip("/")
+            if not placements:
+                cg.mkdir(parents=True)
+                (cg / "cgroup.type").write_text("domain\n")
+                (cg / "cgroup.procs").write_text(f"{pid}\n")
+                for control in ("events", "freeze", "kill"):
+                    if (control, change) != ("kill", "control"):
+                        (cg / f"cgroup.{control}").touch()
+            elif change == "membership":
+                (cg / "cgroup.procs").write_text("")
+            elif change == "generation":
+                cg.rename(cg.with_suffix(".old"))
+                shutil.copytree(cg.with_suffix(".old"), cg)
+            placements.append(path)
+            assert not marker.exists(), "payload ran before the pin was verified"
+            current = "34" * 16 if change == "invocation" and len(placements) > 1 else invocation
+            original_id = cg.stat().st_ino if change != "generation" or len(placements) == 1 else cg.with_suffix(".old").stat().st_ino
+            return ("bus-id", ":1.2", path, current, original_id)
+
+        monkeypatch.setattr(fs, "_read_placement", placement, raising=False)
+        monkeypatch.setattr(fs, "_cgroup_mount", lambda: (17, str(mount)), raising=False)
+        monkeypatch.setattr(fs, "_unified_membership", lambda pid: placements[-1], raising=False)
+        # Fake the kernfs generation at the syscall boundary; directory/control
+        # opens (including the replacement) and the held-launch channel are real.
+        monkeypatch.setattr(fs, "_kernel_handle", lambda fd: (17, os.fstat(fd).st_ino), raising=False)
+        monkeypatch.setattr(fs, "_fd_mount_id", lambda fd: 17, raising=False)
+        reply = make_env().execute(f"echo ran >> {marker}", resource_scope=True, timeout=10)
+        if change is None:
+            assert reply["returncode"] == 0, reply
+            assert marker.read_text() == "ran\n"
+        else:
+            assert reply["returncode"] == 125, reply
+            assert not marker.exists()
+        assert len(placements) == (1 if change == "control" else 2)
+
+    @pytest.mark.parametrize("change", [None, "bus", "manager", "wrong-id-type"])
+    def test_placement_requires_one_bus_epoch_and_typed_generation(self, change, monkeypatch):
+        unit = "hermes-worker-fg-test.scope"
+        obj = "/org/freedesktop/systemd1/unit/hermes_2dworker_2dfg_2dtest_2escope"
+        systemd = "org.freedesktop.systemd1"
+        bus_id, owner = "a" * 32, ":1.7"
+        path, generation = f"/app.slice/{unit}", 4294967373
+        invocation = [18] * 16
+        read_scope = False
+
+        def reply(args, **kwargs):
+            nonlocal read_scope
+            destination, target, interface, member, *parameters = args[args.index("call") + 1:]
+            if member == "GetId":
+                signature, value = "s", "b" * 32 if read_scope and change == "bus" else bus_id
+            elif member == "GetNameOwner":
+                signature, value = "s", ":1.8" if read_scope and change == "manager" else owner
+            else:
+                assert destination == owner
+                if member == "GetUnitByPID":
+                    assert parameters == ["u", "12345"]
+                    signature, value = "o", obj
+                elif parameters == ["s", f"{systemd}.Unit"]:
+                    assert target == obj and member == "GetAll"
+                    signature, value = "a{sv}", {
+                        "Id": {"type": "s", "data": unit},
+                        "ActiveState": {"type": "s", "data": "active"},
+                        "Transient": {"type": "b", "data": True},
+                        "InvocationID": {"type": "ay", "data": invocation},
+                    }
+                else:
+                    assert target == obj and member == "GetAll" and parameters == ["s", f"{systemd}.Scope"]
+                    read_scope = True
+                    signature, value = "a{sv}", {
+                        "ControlGroup": {"type": "s", "data": path},
+                        "ControlGroupId": {"type": "x" if change == "wrong-id-type" else "t", "data": generation},
+                    }
+            return subprocess.CompletedProcess(args, 0, json.dumps({"type": signature, "data": [value]}).encode())
+
+        monkeypatch.setattr(fs, "locate_command", lambda _: type("Located", (), {"command": ("busctl",)})())
+        monkeypatch.setattr(fs.subprocess, "run", reply)
+        if change is None:
+            assert fs._read_placement(12345, unit, {}) == (bus_id, owner, path, "12" * 16, generation)
+        else:
+            with pytest.raises(ValueError):
+                fs._read_placement(12345, unit, {})
 
     @pytest.mark.parametrize("mode", ["lost_create_reply", "unit_exists", "multiline_create_error"])
     def test_create_call_failure_does_not_run_payload_unscoped(self, mode, worker_host, fg_config,
