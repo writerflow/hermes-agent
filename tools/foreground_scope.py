@@ -148,11 +148,6 @@ def limit_note(returncode: int | None, output: str) -> str:
     return LIMIT_NOTE if returncode and _TASKS_LIMIT_TEXT in output else ""
 
 
-def stop_scope(unit: str) -> bool:
-    """Reap the whole scope (setsid escapees included)."""
-    return _registry()._stop_systemd_unit(unit)
-
-
 def warn_bus_lost(spawn_env: Mapping[str, str]) -> None:
     """The wrapper died before starting the command: let the shared probe verdict follow the bus."""
     _registry().scoped_spawn_lost_user_bus(dict(spawn_env))

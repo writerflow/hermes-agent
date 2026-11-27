@@ -1311,15 +1311,12 @@ class LocalEnvironment(BaseEnvironment):
         return proc
 
     def _kill_process(self, proc):
-        """Kill the entire process group (all children), then the whole scope: it also reaps what escaped the
-        group (``setsid``) inside a foreground scope."""
+        """Kill the owned process tree; a requested scope name confers no cleanup authority."""
         try:
             (_kill_process_windows if _IS_WINDOWS else _kill_process_group_posix)(proc)
         except OSError:  # ProcessLookupError / PermissionError included
             with contextlib.suppress(Exception):
                 proc.kill()
-        if unit := foreground_scope.scope_unit_of(proc):
-            foreground_scope.stop_scope(unit)
 
     def _update_cwd(self, result: dict):
         """Base cwd extraction, then one line for the agent when a scoped command failed on the task limit."""

@@ -532,21 +532,18 @@ class TestScopeLifecycle:
         assert not marker.exists()
         assert stopped == []
 
-    def _spy_stop(self, monkeypatch, result=True):
+    def _spy_stop(self, monkeypatch):
         stopped: list[str] = []
-        real = pr._stop_systemd_unit
-        monkeypatch.setattr(pr, "_stop_systemd_unit",
-                            lambda unit: stopped.append(unit) or (real(unit) if result is None else result))
+        monkeypatch.setattr(pr, "_stop_systemd_unit", lambda unit: stopped.append(unit) or True)
         return stopped
 
-    @pytest.mark.live_system_guard_bypass  # stops its own hermes-worker-fg scope, named at run time
     def test_timeout_stops_the_whole_scope(self, worker_host, fg_config, real_systemd_stub, make_env, monkeypatch):
         fg_config()
-        stopped = self._spy_stop(monkeypatch, result=None)
+        stopped = self._spy_stop(monkeypatch)
         result = make_env().execute("sleep 30 & setsid sleep 30 & wait", resource_scope=True, timeout=1)
         assert result["returncode"] == 124, result
         (call,) = real_systemd_stub.calls()
-        assert stopped == [f"{call.unit}.scope"]
+        assert stopped == []
         state = _systemctl("is-active", f"{call.unit}.scope")
         assert state.stdout.strip() == "inactive", state
 
@@ -565,23 +562,24 @@ class TestScopeLifecycle:
         finally:
             _systemctl("stop", f"{call.unit}.scope")
 
-    def test_yield_to_background_carries_the_scope_unit(self, worker_host, fg_config, stub, make_env, monkeypatch):
+    def test_yielded_command_never_stops_a_scope_by_name(self, worker_host, fg_config, stub, make_env, monkeypatch):
         from tools.terminal_tool_background import yield_to_background_handler
         fg_config()
         stopped = self._spy_stop(monkeypatch)
-        proc = make_env()._run_bash("sleep 30", resource_scope=True)
+        command = "echo ready; sleep 30"
+        proc = make_env()._run_bash(command, resource_scope=True)
         try:
+            assert proc.stdout.readline().strip() == "ready"
             handler = yield_to_background_handler(
-                command="sleep 30", env_type="local", cwd=None, effective_task_id="fg-yield",
+                command=command, env_type="local", cwd=None, effective_task_id="fg-yield",
                 task_id="fg-yield", session_key="")
             handed = handler(proc, "")
-            session = pr.process_registry.get(handed["yielded_session_id"])
-            (call,) = stub.calls()
-            assert session.systemd_unit == f"{call.unit}.scope"
-            pr.process_registry.kill_process(session.id)
-            assert stopped == [f"{call.unit}.scope"]
+            pr.process_registry.kill_process(handed["yielded_session_id"])
+            assert len(stub.calls()) == 1
+            assert stopped == []
         finally:
             proc.kill()
+            proc.wait(timeout=5)
 
 
 # --------------------------------------------------------------------------- T4g: Gradle daemon policy
