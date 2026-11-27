@@ -162,7 +162,7 @@ class _FixturePin:
     def is_empty(self):
         return True
 
-    def drain(self, *, timeout):
+    def drain(self, *, timeout, deadline=None):
         return None
 
 
@@ -1044,14 +1044,43 @@ class TestScopeLifecycle:
                 admission._original = fs._PinnedScope(
                     "boot", (proc.pid, 10), (1, 11), ("bus", ":1.2", "/scope", "12" * 16, 1),
                     (17, 1), -1, events.fileno(), freeze.fileno(), stop.fileno(), ExitStack())
-                proc._hermes_scope_admission = admission
-                proc._hermes_scope_unit = f"test-{i}.scope"
+                setattr(proc, "_hermes_scope_admission", admission)
+                setattr(proc, "_hermes_scope_unit", f"test-{i}.scope")
 
             assert base.kill_live_foreground_processes(now=True) == len(procs)
             assert all(proc.wait(timeout=5) < 0 for proc in procs)
             assert controls[0][0].read() == b"0"
             assert all(freeze.read() in (b"", b"0") and stop.read() == b"" for freeze, stop in controls)
             assert elapsed <= base._HARD_KILL_BUDGET_S, elapsed
+
+    def test_hard_exit_closes_held_channel_while_admission_fence_is_busy(self, make_env, monkeypatch):
+        from concurrent.futures import TimeoutError
+        from socket import socketpair
+
+        from tools.environments import base
+
+        monkeypatch.setattr(base, "_exit_fenced", False)
+        env = make_env()
+        with ExitStack() as files:
+            proc = files.enter_context(subprocess.Popen(["sleep", "30"], start_new_session=True))
+            files.callback(proc.kill)
+            parent, child = socketpair()
+            files.enter_context(parent)
+            files.enter_context(child)
+            admission = fs._HeldAdmission(parent)
+            setattr(proc, "_hermes_scope_admission", admission)
+            setattr(proc, "_hermes_scope_unit", "held.scope")
+            monkeypatch.setitem(base._live_foreground, id(proc), (env, proc))
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                with admission._fence:
+                    stopped = pool.submit(base.kill_live_foreground_processes, now=True)
+                    try:
+                        assert stopped.result(timeout=3) == 1
+                    except TimeoutError:
+                        pytest.fail("hard exit waited for the held admission fence")
+                    child.settimeout(3)
+                    assert child.recv(1) == b"", "hard exit left the payload gate open"
+                    assert proc.wait(timeout=3) < 0
 
     def test_timeout_stops_the_whole_scope(self, worker_host, fg_config, real_systemd_stub, make_env, monkeypatch):
         fg_config()

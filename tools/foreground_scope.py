@@ -533,11 +533,33 @@ class _HeldAdmission:
         # The verifier may be doing I/O. Serialize only the final release with
         # cancellation, never wait for verification while holding the fence.
         with self._fence:
-            if not self._closed:
-                self._closed = True
-                with suppress(OSError):
-                    self._channel.shutdown(socket.SHUT_RDWR)
+            self._cancel_locked()
             return self._original is not None
+
+    def _cancel_locked(self) -> None:
+        if not self._closed:
+            self._closed = True
+            with suppress(OSError):
+                self._channel.shutdown(socket.SHUT_RDWR)
+
+    def force_cleanup(self, unit: str, deadline: float | None) -> None:
+        stop_by = time.monotonic() + 0.15
+        deadline = stop_by if deadline is None else min(deadline, stop_by)
+        if not self._fence.acquire(blocking=False):
+            # Close the gate even if the verifier has not reached its send yet.
+            # Only the lock holder may use or release the original descriptors.
+            with suppress(OSError):
+                self._channel.shutdown(socket.SHUT_RDWR)
+            if not self._fence.acquire(timeout=max(0.0, deadline - time.monotonic())):
+                logger.warning("Foreground scope %s: cleanup incomplete: lifecycle fence busy", unit)
+                return
+        try:
+            self._cancel_locked()
+            reason = self._cleanup_locked(timeout=_CLEANUP_TIMEOUT, deadline=deadline)
+        finally:
+            self._fence.release()
+        if reason is not None:
+            logger.warning("Foreground scope %s: cleanup incomplete: %s", unit, reason)
 
     def close(self) -> None:
         self.cancel()
@@ -555,25 +577,29 @@ class _HeldAdmission:
                 self._drained = True
                 self._close_original()
 
-    def cleanup_original(self, unit: str, *, timeout: float, deadline: float | None = None,
+    def cleanup_original(self, unit: str, *, timeout: float,
                          prepare: Callable[[], None] | None = None) -> str | None:
         with self._fence:
-            if self._drained:
-                return None
-            if self._original is None:
-                return "original scope unavailable" if prepare is not None else None
-            if prepare is not None:
-                # The reader can reap the launcher during cooperative shutdown,
-                # but must not close the pin until this explicit stop has used it.
-                with suppress(OSError):
-                    prepare()
-            reason = (self._original.drain(timeout=timeout) if deadline is None else
-                      self._original.drain(timeout=timeout, deadline=deadline))
-            self._drained = reason is None
-            if self._drained and prepare is not None:
-                self._close_original()
+            reason = self._cleanup_locked(timeout=timeout, prepare=prepare)
         if reason is not None:
             logger.warning("Foreground scope %s: cleanup incomplete: %s", unit, reason)
+        return reason
+
+    def _cleanup_locked(self, *, timeout: float, deadline: float | None = None,
+                        prepare: Callable[[], None] | None = None) -> str | None:
+        if self._drained:
+            return None
+        if self._original is None:
+            return "original scope unavailable" if prepare is not None else None
+        if prepare is not None:
+            # The reader can reap the launcher during cooperative shutdown,
+            # but must not close the pin until this explicit stop has used it.
+            with suppress(OSError):
+                prepare()
+        reason = self._original.drain(timeout=timeout, deadline=deadline)
+        self._drained = reason is None
+        if self._drained and prepare is not None:
+            self._close_original()
         return reason
 
 
@@ -691,9 +717,14 @@ def cancel_admission(proc: object) -> bool:
     return admission is not None and admission.cancel()
 
 
-def cleanup_original(proc: object, *, timeout: float = _CLEANUP_TIMEOUT, deadline: float | None = None) -> None:
+def cleanup_original(proc: object, *, timeout: float = _CLEANUP_TIMEOUT) -> None:
     if (admission := getattr(proc, "_hermes_scope_admission", None)) is not None:
-        admission.cleanup_original(scope_unit_of(proc), timeout=timeout, deadline=deadline)
+        admission.cleanup_original(scope_unit_of(proc), timeout=timeout)
+
+
+def force_cleanup_original(proc: object, deadline: float | None) -> None:
+    if (admission := getattr(proc, "_hermes_scope_admission", None)) is not None:
+        admission.force_cleanup(scope_unit_of(proc), deadline)
 
 
 def stop_adopted_scope(proc: subprocess.Popen, prepare: Callable[[], None]) -> str | None:
