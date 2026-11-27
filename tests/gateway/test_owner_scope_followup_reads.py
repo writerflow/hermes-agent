@@ -178,6 +178,47 @@ def test_cron_create_invalidates_snapshot_after_independent_commit(mux, monkeypa
     assert owner_ident in fallback_threads, 'stale independent-commit snapshot was accepted without fallback'
 
 
+def test_cron_create_uses_current_route_after_identity_worker_hop(mux, monkeypatch):
+    from cron import jobs
+    from gateway import session_cron
+
+    runner, homes, loop, call = mux
+    authority = runner.session_authorities.require(homes['beta'])
+    with jobs.use_cron_store(homes['beta']):
+        job = jobs.create_job(prompt='report', schedule='every 1h', deliver='local', model='fixture')
+    config = runner.session_store.config
+    original = config.multiplex_profiles
+    sampled, release = threading.Event(), threading.Event()
+    generation = authority.db._write_generation
+    samples = []
+
+    def hold_after_snapshot():
+        value = generation()
+        samples.append(value)
+        if len(samples) == 4:
+            sampled.set()
+            if not release.wait(30):
+                raise TimeoutError('route change was not released')
+        return value
+
+    monkeypatch.setattr(authority.db, '_write_generation', hold_after_snapshot)
+    future = asyncio.run_coroutine_threadsafe(session_cron.operation(authority, 'submit', {
+        'job_id': job['id'], 'request_id': 'route-change', 'extra_prompt': None}), loop)
+    try:
+        assert sampled.wait(30), 'second identity snapshot was not reached'
+        async def change_route_config():
+            config.multiplex_profiles = not original
+        call(change_route_config())
+    finally:
+        release.set()
+    try:
+        result = future.result(timeout=60)
+        row = authority.db.get_session(result['session_id'])
+        assert row['session_key'].startswith('agent:main:' if original else 'agent:beta:'), row['session_key']
+    finally:
+        config.multiplex_profiles = original
+
+
 def test_cron_create_editor_discovery_never_holds_db_writer_guard(mux, monkeypatch):
     import sqlite3
     from cron import jobs
