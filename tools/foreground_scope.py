@@ -203,9 +203,10 @@ class _PinnedScope:
             time.sleep(min(remaining, 0.01))
         return True
 
-    def drain(self) -> str | None:
+    def drain(self, *, timeout: float = _CLEANUP_TIMEOUT) -> str | None:
         # Admission owns these FDs. No fresh unit or path resolution may grant
         # authority; an invalidated original descriptor only permits refusal.
+        deadline = time.monotonic() + timeout
         try:
             populated, frozen = self._events()
             if populated == b"0":
@@ -214,13 +215,12 @@ class _PinnedScope:
                 return "original scope already frozen"
             try:
                 _write_control(self.freeze, b"1")
-                deadline = time.monotonic() + _CLEANUP_TIMEOUT
                 if not self._wait_for_event(1, b"1", deadline):
                     return "original scope still populated; freeze unconfirmed"
                 if not _verified_frozen_members(self, deadline) or self._events()[1] != b"1":
                     return "original scope member provenance unverified"
                 _write_control(self.kill, b"1")
-                if not self._wait_for_event(0, b"0", time.monotonic() + _CLEANUP_TIMEOUT):
+                if not self._wait_for_event(0, b"0", deadline):
                     return "original scope still populated after teardown"
             finally:
                 # Always release our own freeze request, even on refusal.
@@ -536,11 +536,11 @@ class _HeldAdmission:
                 self._original.close()
                 self._original = None
 
-    def cleanup_original(self, unit: str) -> None:
+    def cleanup_original(self, unit: str, *, timeout: float) -> None:
         with self._fence:
             if self._original is None:
                 return
-            reason = self._original.drain()
+            reason = self._original.drain(timeout=timeout)
         if reason is not None:
             logger.warning("Foreground scope %s: cleanup incomplete: %s", unit, reason)
 
@@ -659,9 +659,9 @@ def cancel_admission(proc: object) -> bool:
     return admission is not None and admission.cancel()
 
 
-def cleanup_original(proc: object) -> None:
+def cleanup_original(proc: object, *, timeout: float = _CLEANUP_TIMEOUT) -> None:
     if (admission := getattr(proc, "_hermes_scope_admission", None)) is not None:
-        admission.cleanup_original(scope_unit_of(proc))
+        admission.cleanup_original(scope_unit_of(proc), timeout=timeout)
 
 
 def wrapper_diagnostic(proc: subprocess.Popen, returncode: int | None) -> tuple[str, bool]:

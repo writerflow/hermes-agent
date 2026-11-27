@@ -1344,8 +1344,10 @@ class LocalEnvironment(BaseEnvironment):
             result["output"] = f"{result['output']}\n{note}"
 
     def _force_kill_process(self, proc):
-        """SIGKILL the whole group with no TERM grace or wait: the caller os._exit()s next."""
-        foreground_scope.cancel_admission(proc)
+        """Force cleanup with no TERM grace: the caller os._exit()s next."""
+        if foreground_scope.cancel_admission(proc):
+            # The group stop can end the ancestry evidence needed by the scope check.
+            foreground_scope.cleanup_original(proc, timeout=0.15)
         if _IS_WINDOWS:  # already a forced tree kill
             return self._kill_process(proc)
         with contextlib.suppress(OSError):

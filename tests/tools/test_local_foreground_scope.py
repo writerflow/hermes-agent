@@ -159,7 +159,7 @@ class _FixturePin:
     def close(self):
         pass
 
-    def drain(self):
+    def drain(self, *, timeout):
         return None
 
 
@@ -857,8 +857,9 @@ class TestScopeLifecycle:
         assert any("cleanup incomplete: original scope still populated" in report for report in reports) == populated
 
     @pytest.mark.parametrize("member_owned", [True, False])
-    def test_timeout_checks_frozen_recursive_members_before_stopping_original(
-        self, member_owned, worker_host, fg_config, stub, make_env, monkeypatch, tmp_path, caplog,
+    @pytest.mark.parametrize("force", [False, True], ids=["timeout", "hard-exit"])
+    def test_cleanup_checks_frozen_recursive_members_before_stopping_original(
+        self, member_owned, force, worker_host, fg_config, stub, make_env, monkeypatch, tmp_path, caplog,
     ):
         fg_config()
         stopped = self._spy_stop(monkeypatch)
@@ -906,8 +907,27 @@ class TestScopeLifecycle:
                                        (17, 1), directory, events, freeze, kill, files.pop_all())
 
         monkeypatch.setattr(fs, "_pin_original", pin_original)
-        result = make_env().execute(f"touch '{marker}'; exec sleep 30", resource_scope=True, timeout=2)
-        assert result["returncode"] == 124 and marker.is_file(), result
+        env = make_env()
+        command = f"touch '{marker}'; exec sleep 30"
+        if force:
+            from tests.waiting import wait_until
+            from tools.environments import base
+
+            # Drive the real hard-exit dispatcher without exiting the test process.
+            monkeypatch.setattr(base, "_exit_fenced", False)
+
+            def force_exit():
+                assert wait_until(marker.is_file, timeout=4), "command was not admitted before hard exit"
+                return base.kill_live_foreground_processes(now=True)
+
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                stopped_live = pool.submit(force_exit)
+                result = env.execute(command, resource_scope=True, timeout=5)
+                assert stopped_live.result(timeout=5) == 1
+            assert result["returncode"] != 0, result
+        else:
+            result = env.execute(command, resource_scope=True, timeout=2)
+            assert result["returncode"] == 124 and marker.is_file(), result
         assert stopped == []
         assert (original / "cgroup.kill").read_bytes() == (b"1" if member_owned else b"")
         assert (original / "cgroup.freeze").read_bytes() == b"0"
