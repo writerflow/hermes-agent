@@ -20,12 +20,13 @@ def test_cron_create_other_reads_are_off_loop(mux, monkeypatch, site):
         job = jobs.create_job(prompt='report', schedule='every 1h', deliver='local', model='fixture')
     observed = []
     if site == 'session':
-        real = authority.db.get_session
-        def probe(*args, **kwargs):
-            if not observed:
+        real = authority.db._read_one
+        def probe(sql, params=()):
+            # Capture the initial identity query, not later owner-side restore reads.
+            if not observed and 'FROM sessions' in sql:
                 observed.append((Path(authority.db.db_path).resolve().parent, threading.get_ident()))
-            return real(*args, **kwargs)
-        monkeypatch.setattr(authority.db, 'get_session', probe)
+            return real(sql, params)
+        monkeypatch.setattr(authority.db, '_read_one', probe)
     else:
         real = run._load_gateway_config
         def config_probe(config_path=None):
