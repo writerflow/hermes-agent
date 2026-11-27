@@ -57,6 +57,7 @@ _WRAPPER_FAILURE = re.compile(r"Failed to (connect to (the )?(user )?bus|create 
 _MAX_WRAPPER_STDERR = 8192
 _ADMISSION_TIMEOUT = 5.0
 _CREDENTIALS = struct.Struct("iII")  # Linux struct ucred: pid, uid, gid
+_ANCHOR_PID = struct.Struct("=I")
 # Record that the post-placement helper ran before allowing any payload code.
 # This byte vetoes replay; it does not prove successful placement or grant cleanup authority.
 _EXEC_PAYLOAD = """\
@@ -109,7 +110,8 @@ os.close(fd)
 gate = socket.socket(fileno=gate_fd)
 gate.settimeout(10)
 read_fd, write_fd = os.pipe()
-if not os.fork():
+anchor_pid = os.fork()
+if not anchor_pid:
     os.close(read_fd)
     reap_payload(gate, write_fd)
 os.close(write_fd)
@@ -117,7 +119,8 @@ with os.fdopen(read_fd, 'rb') as status:
     with gate:
         if status.read(1) == b'R':
             try:
-                gate.send(b'R' + os.environ.get('INVOCATION_ID', '').encode('ascii'))
+                gate.send(b'R' + struct.pack('=I', anchor_pid)
+                          + os.environ.get('INVOCATION_ID', '').encode('ascii'))
             except (OSError, UnicodeError):
                 pass  # No release can arrive; the held payload will refuse.
     close_stdio()
@@ -163,6 +166,7 @@ class _LaunchStreams:
 class _PinnedScope:
     boot: str
     launcher: tuple[int, int]
+    anchor: tuple[int, int]
     placement: tuple[str, str, str, str, int]
     handle: tuple[int, int]
     directory: int
@@ -305,12 +309,36 @@ def _read_control(directory: int, name: str) -> str:
         return file.read()
 
 
-def _pin_original(proc: subprocess.Popen, unit: str, invocation_id: bytes) -> _PinnedScope | None:
+def _process_parent_birth(pid: int) -> tuple[int, int]:
+    """Read parent PID and process start ticks in one procfs snapshot."""
+    with open(f"/proc/{pid}/stat", "rb") as file:
+        fields = file.read().rsplit(b")", 1)[1].split()
+    if fields[0] in (b"Z", b"X", b"x"):
+        raise ValueError("process no longer live")
+    return int(fields[1]), int(fields[19])
+
+
+def _verify_held_members(directory: int, path: str, launcher: tuple[int, int],
+                         anchor: tuple[int, int]) -> bool:
+    pid, birth = launcher
+    anchor_pid, anchor_birth = anchor
+    members = set(_read_control(directory, "cgroup.procs").splitlines())
+    return ({str(pid), str(anchor_pid)} <= members
+            and _unified_membership(pid) == _unified_membership(anchor_pid) == path
+            and _process_parent_birth(anchor_pid) == (pid, anchor_birth)
+            and process_start_time_stdlib(pid) == birth)
+
+
+def _pin_original(proc: subprocess.Popen, unit: str, invocation_id: bytes,
+                  anchor_pid: int) -> _PinnedScope | None:
     if not re.fullmatch(rb"[0-9a-f]{32}", invocation_id) or invocation_id == b"0" * 32:
         return None
     try:
         env, birth = getattr(proc, "_hermes_scope_launch")
         if birth is None or process_start_time_stdlib(proc.pid) != birth:
+            return None
+        parent, anchor_birth = _process_parent_birth(anchor_pid)
+        if parent != proc.pid or anchor_birth < birth:
             return None
         with open("/proc/sys/kernel/random/boot_id", encoding="ascii") as file:
             boot = file.read().strip()
@@ -339,14 +367,13 @@ def _pin_original(proc: subprocess.Popen, unit: str, invocation_id: bytes) -> _P
             with ExitStack() as current:
                 if _kernel_handle(_open_cgroup(mount, parts, current)) != handle:
                     return None
-            if (_unified_membership(proc.pid) != path or
-                    str(proc.pid) not in _read_control(directory, "cgroup.procs").splitlines() or
-                    process_start_time_stdlib(proc.pid) != birth):
+            launcher, anchor = (proc.pid, birth), (anchor_pid, anchor_birth)
+            if not _verify_held_members(directory, path, launcher, anchor):
                 return None
             events, freeze, kill = controls
-            return _PinnedScope(boot, (proc.pid, birth), placement, handle, directory,
+            return _PinnedScope(boot, launcher, anchor, placement, handle, directory,
                                 events, freeze, kill, files.pop_all())
-    except (OSError, ValueError, TypeError, KeyError, AttributeError, subprocess.SubprocessError):
+    except (OSError, ValueError, TypeError, LookupError, AttributeError, subprocess.SubprocessError):
         # No command, env, or manager output in logs. A missing capability is
         # indistinguishable from uncertain placement for admission purposes.
         return None
@@ -361,10 +388,11 @@ class _HeldAdmission:
 
     def verify_and_release(self, proc: subprocess.Popen, unit: str) -> None:
         try:
-            invocation_id = self._receive(proc.pid)
-            if invocation_id is None or proc.poll() is not None:
+            receipt = self._receive(proc.pid)
+            if receipt is None or proc.poll() is not None:
                 return
-            original = _pin_original(proc, unit, invocation_id)
+            invocation_id, anchor_pid = receipt
+            original = _pin_original(proc, unit, invocation_id, anchor_pid)
             if original is None:
                 logger.warning("Foreground scope %s: placement unverified; payload not released", unit)
                 return
@@ -381,15 +409,18 @@ class _HeldAdmission:
                 self._closed = True
                 self._channel.close()
 
-    def _receive(self, pid: int) -> bytes | None:
-        data, ancillary, flags, _ = self._channel.recvmsg(34, socket.CMSG_SPACE(_CREDENTIALS.size))
-        if flags & (socket.MSG_TRUNC | socket.MSG_CTRUNC) or not data.startswith(b"R"):
+    def _receive(self, pid: int) -> tuple[bytes, int] | None:
+        header = 1 + _ANCHOR_PID.size
+        data, ancillary, flags, _ = self._channel.recvmsg(header + 32, socket.CMSG_SPACE(_CREDENTIALS.size))
+        if flags & (socket.MSG_TRUNC | socket.MSG_CTRUNC) or not data.startswith(b"R") or len(data) < header:
             return None
         for level, kind, credentials in ancillary:
             if (level, kind, len(credentials)) == (socket.SOL_SOCKET, socket.SCM_CREDENTIALS, _CREDENTIALS.size):
                 sender, uid, _ = _CREDENTIALS.unpack(credentials)
                 if (sender, uid) == (pid, os.geteuid()):
-                    return data[1:]
+                    anchor_pid, = _ANCHOR_PID.unpack_from(data, 1)
+                    if 0 < anchor_pid < 2**31 and anchor_pid != pid:
+                        return data[header:], anchor_pid
         return None
 
     def cancel(self) -> None:

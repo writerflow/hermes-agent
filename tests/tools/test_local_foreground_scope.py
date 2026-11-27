@@ -645,7 +645,7 @@ class TestScopeLifecycle:
         stopped = self._spy_stop(monkeypatch)
         held = []
 
-        def pin_original(proc, unit, invocation_id):
+        def pin_original(proc, unit, invocation_id, anchor_pid):
             held.append(proc)
             verifying.set()
             assert finish_verification.wait(5), "verification barrier was not released"
@@ -678,7 +678,7 @@ class TestScopeLifecycle:
         assert len(stub.calls()) == 1
         assert stopped == []
 
-    @pytest.mark.parametrize("change", [None, "invocation", "membership", "generation", "control"])
+    @pytest.mark.parametrize("change", [None, "invocation", "membership", "generation", "control", "anchor"])
     def test_held_launch_pins_controls_only_for_the_original_placement(
         self, change, worker_host, fg_config, stub_factory, make_env, monkeypatch, tmp_path,
     ):
@@ -698,7 +698,10 @@ class TestScopeLifecycle:
             if not placements:
                 cg.mkdir(parents=True)
                 (cg / "cgroup.type").write_text("domain\n")
-                (cg / "cgroup.procs").write_text(f"{pid}\n")
+                children = Path(f"/proc/{pid}/task/{pid}/children").read_text().split()
+                anchor, = children
+                members = [str(pid)] if change == "anchor" else [str(pid), anchor]
+                (cg / "cgroup.procs").write_text("\n".join(members) + "\n")
                 for control in ("events", "freeze", "kill"):
                     if (control, change) != ("kill", "control"):
                         (cg / f"cgroup.{control}").touch()
@@ -821,7 +824,7 @@ class TestScopeLifecycle:
         for name in ("cgroup.freeze", "cgroup.kill"):
             (controls / name).write_text("")
 
-        def pin_original(proc, unit, invocation_id):
+        def pin_original(proc, unit, invocation_id, anchor_pid):
             with ExitStack() as files:
                 directory = os.open(controls, os.O_DIRECTORY)
                 files.callback(os.close, directory)
@@ -832,9 +835,10 @@ class TestScopeLifecycle:
                     fds.append(fd)
                 events.rename(controls / "original.events")
                 events.write_text(f"populated {int(not populated)}\nfrozen 0\n")
-                return fs._PinnedScope("boot", (proc.pid, 1),
+                original_events, freeze, kill = fds
+                return fs._PinnedScope("boot", (proc.pid, 1), (anchor_pid, 1),
                                        ("bus", ":1.2", f"/app.slice/{unit}", "12" * 16, 1),
-                                       (17, 1), directory, *fds, files.pop_all())
+                                       (17, 1), directory, original_events, freeze, kill, files.pop_all())
 
         monkeypatch.setattr(fs, "_pin_original", pin_original)
         result = make_env().execute(f"touch '{marker}'; exec sleep 30", resource_scope=True, timeout=2)
