@@ -1002,6 +1002,57 @@ class TestScopeLifecycle:
         reports = [record.getMessage() for record in caplog.records if record.name == fs.__name__]
         assert any("cleanup incomplete" in report for report in reports) is not drained
 
+    def test_hard_exit_shares_scope_cleanup_budget(self, make_env, monkeypatch, tmp_path):
+        from socket import socketpair
+        from types import SimpleNamespace
+
+        from tools.environments import base
+
+        # Model a kernel that never confirms a freeze. Advance virtual time
+        # only during polling so the aggregate budget is independent of load.
+        elapsed = 0.0
+
+        def advance(seconds):
+            nonlocal elapsed
+            elapsed += seconds
+
+        clock = SimpleNamespace(monotonic=lambda: elapsed, sleep=advance)
+        monkeypatch.setattr(base, "time", clock)
+        monkeypatch.setattr(fs, "time", clock)
+        monkeypatch.setattr(base, "_exit_fenced", False)
+        env = make_env()
+        procs, controls = [], []
+        with ExitStack() as files:
+            for i in range(5):
+                proc = files.enter_context(subprocess.Popen(["sleep", "30"], start_new_session=True))
+                files.callback(proc.kill)
+                procs.append(proc)
+                monkeypatch.setitem(base._live_foreground, id(proc), (env, proc))
+                if i == 4:  # the unscoped command must still be stopped after budget expiry
+                    continue
+                directory = tmp_path / str(i)
+                directory.mkdir()
+                (directory / "events").write_bytes(b"populated 1\nfrozen 0\n")
+                events = files.enter_context((directory / "events").open("rb"))
+                freeze = files.enter_context((directory / "freeze").open("w+b"))
+                stop = files.enter_context((directory / "stop").open("w+b"))
+                controls.append((freeze, stop))
+                parent, child = socketpair()
+                files.enter_context(parent)
+                files.enter_context(child)
+                admission = fs._HeldAdmission(parent)
+                admission._original = fs._PinnedScope(
+                    "boot", (proc.pid, 10), (1, 11), ("bus", ":1.2", "/scope", "12" * 16, 1),
+                    (17, 1), -1, events.fileno(), freeze.fileno(), stop.fileno(), ExitStack())
+                proc._hermes_scope_admission = admission
+                proc._hermes_scope_unit = f"test-{i}.scope"
+
+            assert base.kill_live_foreground_processes(now=True) == len(procs)
+            assert all(proc.wait(timeout=5) < 0 for proc in procs)
+            assert controls[0][0].read() == b"0"
+            assert all(freeze.read() in (b"", b"0") and stop.read() == b"" for freeze, stop in controls)
+            assert elapsed <= base._HARD_KILL_BUDGET_S, elapsed
+
     def test_timeout_stops_the_whole_scope(self, worker_host, fg_config, real_systemd_stub, make_env, monkeypatch):
         fg_config()
         stopped = self._spy_stop(monkeypatch)

@@ -206,10 +206,13 @@ class _PinnedScope:
             time.sleep(min(remaining, 0.01))
         return True
 
-    def drain(self, *, timeout: float = _CLEANUP_TIMEOUT) -> str | None:
+    def drain(self, *, timeout: float = _CLEANUP_TIMEOUT, deadline: float | None = None) -> str | None:
         # Admission owns these FDs. No fresh unit or path resolution may grant
         # authority; an invalidated original descriptor only permits refusal.
-        deadline = time.monotonic() + timeout
+        stop_by = time.monotonic() + timeout
+        deadline = stop_by if deadline is None else min(deadline, stop_by)
+        if time.monotonic() >= deadline:
+            return "original scope cleanup deadline expired"
         try:
             populated, frozen = self._events()
             if populated == b"0":
@@ -552,7 +555,7 @@ class _HeldAdmission:
                 self._drained = True
                 self._close_original()
 
-    def cleanup_original(self, unit: str, *, timeout: float,
+    def cleanup_original(self, unit: str, *, timeout: float, deadline: float | None = None,
                          prepare: Callable[[], None] | None = None) -> str | None:
         with self._fence:
             if self._drained:
@@ -564,7 +567,8 @@ class _HeldAdmission:
                 # but must not close the pin until this explicit stop has used it.
                 with suppress(OSError):
                     prepare()
-            reason = self._original.drain(timeout=timeout)
+            reason = (self._original.drain(timeout=timeout) if deadline is None else
+                      self._original.drain(timeout=timeout, deadline=deadline))
             self._drained = reason is None
             if self._drained and prepare is not None:
                 self._close_original()
@@ -687,9 +691,9 @@ def cancel_admission(proc: object) -> bool:
     return admission is not None and admission.cancel()
 
 
-def cleanup_original(proc: object, *, timeout: float = _CLEANUP_TIMEOUT) -> None:
+def cleanup_original(proc: object, *, timeout: float = _CLEANUP_TIMEOUT, deadline: float | None = None) -> None:
     if (admission := getattr(proc, "_hermes_scope_admission", None)) is not None:
-        admission.cleanup_original(scope_unit_of(proc), timeout=timeout)
+        admission.cleanup_original(scope_unit_of(proc), timeout=timeout, deadline=deadline)
 
 
 def stop_adopted_scope(proc: subprocess.Popen, prepare: Callable[[], None]) -> str | None:
