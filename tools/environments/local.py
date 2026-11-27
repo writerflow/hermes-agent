@@ -1249,7 +1249,7 @@ class LocalEnvironment(BaseEnvironment):
             start_new_session=True, cwd=self.cwd,
             **({"creationflags": windows_hide_flags()} if _IS_WINDOWS else {}))
         if scoped is not None:
-            # The wrapper execs in place: the Popen pid, group and start time are the command's own.
+            # The wrapper execs the held launcher in place; the launcher leads the command's group.
             proc._hermes_scope_unit = scoped.unit
             proc._hermes_scope_retry = (cmd_string, login, timeout, stdin_data, run_env)
         if not _IS_WINDOWS:

@@ -60,22 +60,76 @@ _CREDENTIALS = struct.Struct("iII")  # Linux struct ucred: pid, uid, gid
 # Record that the post-placement helper ran before allowing any payload code.
 # This byte vetoes replay; it does not prove successful placement or grant cleanup authority.
 _EXEC_PAYLOAD = """\
-import os, socket, sys
+import ctypes, os, signal, socket, struct, sys
+
+def run_payload(gate, status_fd):
+    os.close(status_fd)
+    with gate:
+        try:
+            admitted = gate.recv(2) == b'G'
+        except OSError:
+            admitted = False
+    if not admitted:
+        os._exit(125)
+    os.dup2(1, 2)
+    os.execvp(sys.argv[3], sys.argv[3:])
+
+def close_stdio():
+    for fd in (0, 1, 2):
+        os.close(fd)
+
+def reap_payload(gate, status_fd):
+    # PR_SET_CHILD_SUBREAPER: detached orphans stay attributable to this launch.
+    if ctypes.CDLL(None).prctl(36, 1, 0, 0, 0) != 0:
+        os._exit(125)
+    payload = os.fork()
+    if not payload:
+        run_payload(gate, status_fd)
+    gate.close()
+    close_stdio()
+    os.write(status_fd, b'R')
+    while True:
+        try:
+            pid, status = os.waitpid(-1, 0)
+        except ChildProcessError:
+            os._exit(0)
+        if pid == payload:
+            # Publish the payload result now, without waiting on a deliberately
+            # persistent descendant or keeping the terminal's streams open.
+            try:
+                os.write(status_fd, struct.pack('i', os.waitstatus_to_exitcode(status)))
+            except BrokenPipeError:
+                pass  # The result waiter has gone away; still reap adopted children.
+            os.close(status_fd)
+
 fd, gate_fd = map(int, sys.argv[1:3])
 if os.pwrite(fd, b'1', 0) != 1:
     raise SystemExit(125)
 os.close(fd)
-with socket.socket(fileno=gate_fd) as gate:
-    gate.settimeout(10)
-    try:
-        gate.send(b'R' + os.environ.get('INVOCATION_ID', '').encode('ascii'))
-        admitted = gate.recv(2) == b'G'
-    except (OSError, UnicodeError):
-        admitted = False
-if not admitted:
-    raise SystemExit(125)
-os.dup2(1, 2)
-os.execvp(sys.argv[3], sys.argv[3:])
+gate = socket.socket(fileno=gate_fd)
+gate.settimeout(10)
+read_fd, write_fd = os.pipe()
+if not os.fork():
+    os.close(read_fd)
+    reap_payload(gate, write_fd)
+os.close(write_fd)
+with os.fdopen(read_fd, 'rb') as status:
+    with gate:
+        if status.read(1) == b'R':
+            try:
+                gate.send(b'R' + os.environ.get('INVOCATION_ID', '').encode('ascii'))
+            except (OSError, UnicodeError):
+                pass  # No release can arrive; the held payload will refuse.
+    close_stdio()
+    result = status.read(4)
+if len(result) != 4:
+    os._exit(125)
+code, = struct.unpack('i', result)
+if code < 0:
+    if -code != signal.SIGKILL:
+        signal.signal(-code, signal.SIG_DFL)
+    os.kill(os.getpid(), -code)
+os._exit(code)
 """
 # The one limit text a probe has confirmed: bash's fork failure under TasksMax (EAGAIN).
 _TASKS_LIMIT_TEXT = "Resource temporarily unavailable"

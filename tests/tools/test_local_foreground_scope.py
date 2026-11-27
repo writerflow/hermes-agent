@@ -18,7 +18,9 @@ import ast
 import json
 import os
 import re
+import shlex
 import shutil
+import socket
 import stat
 import subprocess
 import sys
@@ -550,6 +552,50 @@ class TestPropertySet:
 # --------------------------------------------------------------------------- T4: kill, timeout, yield
 @pytest.mark.platforms("linux")
 class TestScopeLifecycle:
+    def test_detached_child_keeps_owned_parent_after_command_exit(
+        self, worker_host, fg_config, stub, make_env, tmp_path,
+    ):
+        fg_config()
+        script = tmp_path / "orphan.py"
+        script.write_text(textwrap.dedent("""\
+            import os, socket, sys
+
+            parent = os.getppid()
+            intermediate = os.fork()
+            if intermediate:
+                os.waitpid(intermediate, 0)
+                print('payload finished', flush=True)
+                sys.exit(17)
+            os.setsid()
+            if os.fork():
+                os._exit(0)
+            for fd in (0, 1, 2):
+                os.close(fd)
+            with socket.socket(socket.AF_UNIX) as sock:
+                sock.settimeout(10)
+                sock.connect(bytes.fromhex(sys.argv[1]))
+                sock.sendall(f'{os.getpid()} {parent}\\n'.encode())
+                if sock.recv(1) == b'?':
+                    sock.sendall(b'!')
+        """))
+        address = b"\0hermes-test-" + os.urandom(16).hex().encode()
+        command = "exec " + shlex.join([sys.executable, str(script), address.hex()])
+        with socket.socket(socket.AF_UNIX) as listener:
+            listener.settimeout(5)
+            listener.bind(address)
+            listener.listen(1)
+            result = make_env().execute(command, resource_scope=True, timeout=5)
+            assert result["returncode"] == 17, result
+            assert result["output"].strip() == "payload finished"
+            connection, _ = listener.accept()
+            with connection, connection.makefile("rb") as info:
+                connection.settimeout(2)
+                child, anchor = map(int, info.readline().split())
+                _, parent, *_ = Path(f"/proc/{child}/stat").read_text().rsplit(")", 1)[1].split()
+                assert int(parent) == anchor, "detached child lost its original launcher ancestry"
+                connection.sendall(b"?")
+                assert connection.recv(1) == b"!"
+
     @pytest.mark.parametrize("redirect", ["", " >&2"])
     def test_payload_bus_diagnostic_does_not_trigger_fallback(self, redirect, worker_host, fg_config,
                                                              stub, make_env, tmp_path):
