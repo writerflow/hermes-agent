@@ -1328,6 +1328,8 @@ class LocalEnvironment(BaseEnvironment):
         except OSError:  # ProcessLookupError / PermissionError included
             with contextlib.suppress(Exception):
                 proc.kill()
+        finally:
+            foreground_scope.report_cleanup(proc)
 
     def _update_cwd(self, result: dict):
         """Base cwd extraction, then one line for the agent when a scoped command failed on the task limit."""

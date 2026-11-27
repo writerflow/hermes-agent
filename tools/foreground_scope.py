@@ -120,6 +120,20 @@ class _PinnedScope:
     def close(self) -> None:
         self.files.close()
 
+    def cleanup_incomplete_reason(self) -> str | None:
+        # Observe the original subtree through its already-open descriptor.
+        # A fresh read by name could instead report a replacement's state.
+        try:
+            rows = os.pread(self.events, 4096, 0).splitlines()
+        except OSError:
+            rows = []
+        populated = [row.split() for row in rows if row.split()[:1] == [b"populated"]]
+        if populated == [[b"populated", b"0"]]:
+            return None
+        if populated == [[b"populated", b"1"]]:
+            return "original scope still populated"
+        return "original scope state unverified"
+
 
 def _read_placement(pid: int, unit: str, env: Mapping[str, str]) -> tuple[str, str, str, str, int]:
     # Resolve by the held PID, not by the requested name. Pin the D-Bus bus
@@ -340,6 +354,14 @@ class _HeldAdmission:
                 self._original.close()
                 self._original = None
 
+    def report_cleanup(self, unit: str) -> None:
+        with self._fence:
+            if self._original is None:
+                return
+            reason = self._original.cleanup_incomplete_reason()
+        if reason is not None:
+            logger.warning("Foreground scope %s: cleanup incomplete: %s", unit, reason)
+
 
 def foreground_scope_host() -> bool:
     """Whether this process is a place whose foreground commands belong in a scope: a managed worker or the
@@ -452,6 +474,11 @@ def start_admission(proc: subprocess.Popen, unit: str) -> None:
 def cancel_admission(proc: object) -> None:
     if (admission := getattr(proc, "_hermes_scope_admission", None)) is not None:
         admission.cancel()
+
+
+def report_cleanup(proc: object) -> None:
+    if (admission := getattr(proc, "_hermes_scope_admission", None)) is not None:
+        admission.report_cleanup(scope_unit_of(proc))
 
 
 def wrapper_diagnostic(proc: subprocess.Popen, returncode: int | None) -> tuple[str, bool]:

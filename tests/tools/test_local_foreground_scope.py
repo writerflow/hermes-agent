@@ -25,6 +25,7 @@ import sys
 import textwrap
 import time
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack
 from contextvars import copy_context
 from dataclasses import dataclass
 from pathlib import Path
@@ -155,6 +156,9 @@ def stub(stub_factory) -> SystemdStub:
 class _FixturePin:
     def close(self):
         pass
+
+    def cleanup_incomplete_reason(self):
+        return None
 
 
 def _fixture_pin(*_):
@@ -595,15 +599,11 @@ class TestScopeLifecycle:
         stopped = self._spy_stop(monkeypatch)
         held = []
 
-        class FixtureOriginal:
-            def close(self):
-                pass
-
         def pin_original(proc, unit, invocation_id):
             held.append(proc)
             verifying.set()
             assert finish_verification.wait(5), "verification barrier was not released"
-            return FixtureOriginal()
+            return _FixturePin()
 
         # Substitute only the manager/kernel object verification: run the actual
         # launcher, helper, admission channel, and terminal waiter.
@@ -761,6 +761,45 @@ class TestScopeLifecycle:
         monkeypatch.setattr(pr, "_stop_systemd_unit", lambda unit: stopped.append(unit) or True)
         return stopped
 
+    @pytest.mark.parametrize("populated", [True, False])
+    def test_timeout_reports_remaining_members_from_the_original_pin(
+        self, populated, worker_host, fg_config, stub, make_env, monkeypatch, tmp_path, caplog,
+    ):
+        fg_config()
+        stopped = self._spy_stop(monkeypatch)
+        marker = tmp_path / "started"
+        controls = tmp_path / "controls"
+        controls.mkdir()
+        events = controls / "cgroup.events"
+        events.write_text(f"populated {int(populated)}\nfrozen 0\n")
+        for name in ("cgroup.freeze", "cgroup.kill"):
+            (controls / name).write_text("")
+
+        def pin_original(proc, unit, invocation_id):
+            with ExitStack() as files:
+                directory = os.open(controls, os.O_DIRECTORY)
+                files.callback(os.close, directory)
+                fds = []
+                for name, access in (("events", os.O_RDONLY), ("freeze", os.O_WRONLY), ("kill", os.O_WRONLY)):
+                    fd = os.open(f"cgroup.{name}", access, dir_fd=directory)
+                    files.callback(os.close, fd)
+                    fds.append(fd)
+                events.rename(controls / "original.events")
+                events.write_text(f"populated {int(not populated)}\nfrozen 0\n")
+                return fs._PinnedScope("boot", (proc.pid, 1),
+                                       ("bus", ":1.2", f"/app.slice/{unit}", "12" * 16, 1),
+                                       (17, 1), directory, *fds, files.pop_all())
+
+        monkeypatch.setattr(fs, "_pin_original", pin_original)
+        result = make_env().execute(f"touch '{marker}'; exec sleep 30", resource_scope=True, timeout=2)
+        assert result["returncode"] == 124, result
+        assert marker.is_file(), "timed out before the admitted payload started"
+        assert stopped == []
+        assert (controls / "cgroup.freeze").read_bytes() == b""
+        assert (controls / "cgroup.kill").read_bytes() == b""
+        reports = [record.getMessage() for record in caplog.records if record.name == fs.__name__]
+        assert any("cleanup incomplete: original scope still populated" in report for report in reports) == populated
+
     def test_timeout_stops_the_whole_scope(self, worker_host, fg_config, real_systemd_stub, make_env, monkeypatch):
         fg_config()
         stopped = self._spy_stop(monkeypatch)
@@ -795,8 +834,9 @@ class TestScopeLifecycle:
         fg_config()
         closed = Event()
 
-        class Pin:
-            close = closed.set
+        class Pin(_FixturePin):
+            def close(self):
+                closed.set()
 
         monkeypatch.setattr(fs, "_pin_original", lambda *_: Pin())
         started = tmp_path / "started"
