@@ -2012,9 +2012,18 @@ class TestSystemdCgroupIsolation:
 
         return fake_popen, captured
 
+    @pytest.fixture
+    def verified_launcher(self, monkeypatch):
+        # These tests replace the process itself. The real child handshake is
+        # exercised separately in test_retained_work_scope.py.
+        owner, launcher = MagicMock(), MagicMock()
+        owner.recv.return_value = b"V"
+        launcher.fileno.return_value = 12
+        monkeypatch.setattr("tools.process_registry.socket.socketpair", lambda: (owner, launcher))
+
     @pytest.mark.platforms("linux")
     def test_wraps_in_systemd_scope_when_supervisor_and_available(
-        self, registry, monkeypatch, _gateway_identity
+        self, registry, monkeypatch, _gateway_identity, verified_launcher
     ):
         """Under a supervisor with systemd-run available, the spawn argv is
         wrapped in ``systemd-run --user --scope --unit=hermes-worker-<id>``."""
@@ -2055,10 +2064,7 @@ class TestSystemdCgroupIsolation:
             if value == "--property"
         ]
         assert "MemoryAccounting=yes" in properties
-        # systemd rejects OOMPolicy= on transient --scope units across the versions
-        # users run (239/245/249, #102486); emitting it fails the probe and every
-        # cron worker dispatch. MemoryMax + MemoryAccounting carry the isolation.
-        assert not any(p.startswith("OOMPolicy=") for p in properties), properties
+        assert "OOMPolicy=continue" in properties
         memory_max = next(
             value for value in properties if value.startswith("MemoryMax=")
         )
@@ -2232,7 +2238,7 @@ class TestSystemdCgroupIsolation:
 
     @pytest.mark.platforms("linux")
     def test_systemd_post_spawn_failure_never_kills_gateway_process_group(
-        self, registry, monkeypatch, _gateway_identity
+        self, registry, monkeypatch, _gateway_identity, verified_launcher
     ):
         """Cleanup must not killpg: scope teardown is the authoritative path."""
         fake_popen, _captured = self._fake_popen_capture()
@@ -2266,7 +2272,7 @@ class TestSystemdCgroupIsolation:
         killpg.assert_not_called()
 
     @pytest.mark.platforms("linux")
-    def test_pty_spawn_is_wrapped_in_systemd_scope(self, registry, monkeypatch, _gateway_identity):
+    def test_pty_spawn_is_wrapped_in_systemd_scope(self, registry, monkeypatch, _gateway_identity, verified_launcher):
         """Interactive executors receive the same sibling-cgroup isolation."""
         from ptyprocess import PtyProcess
 
@@ -2322,8 +2328,11 @@ class TestSystemdCgroupIsolation:
         ) as pty_spawn, patch("subprocess.Popen", side_effect=AssertionError("unexpected pipe launch")) as pipe_spawn, patch(
             "tools.process_registry._stop_systemd_unit", return_value=True
         ) as stop_unit:
-            with pytest.raises(error, match="did not confirm launch"):
+            from tools.process_registry import RestartSafeScopeUnavailable
+
+            with pytest.raises(RestartSafeScopeUnavailable, match="not verified") as exc:
                 registry.spawn_local("codex", cwd="/tmp", use_pty=True)
+            assert isinstance(exc.value.__cause__, error)
 
         assert "--scope" in pty_spawn.call_args.args[0]
         stop_unit.assert_not_called()

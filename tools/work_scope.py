@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 import subprocess
 import sys
 import time
@@ -140,6 +141,10 @@ def scoped_payload(name: str, command: list[str]) -> list[str]:
     return [*probe_payload(name), *command]
 
 
+def held_scope_payload(name: str, control_fd: int, command: list[str]) -> list[str]:
+    return [*probe_payload(name), "--control-fd", str(control_fd), *command]
+
+
 def _verify_scope_launch(name: str, *, expected_invocation: str | None = None) -> None:
     lines = Path("/proc/self/cgroup").read_text(encoding="utf-8").splitlines()
     membership = next((line[3:] for line in lines if line.startswith("0::")), "")
@@ -149,10 +154,21 @@ def _verify_scope_launch(name: str, *, expected_invocation: str | None = None) -
 
 
 def _run_scope_launcher(name: str, command: list[str]) -> int:
+    # v255 waits for the create job and passes the invocation ID of its own
+    # unit. The caller clears any inherited ID before launch.
+    invocation = os.environ.get("INVOCATION_ID", "") if command else None
     try:
-        # systemd-run v255 waits for the create job and passes the invocation
-        # ID of its own unit. The caller clears any inherited ID before launch.
-        _verify_scope_launch(name, expected_invocation=os.environ.get("INVOCATION_ID", "") if command else None)
+        if command[:1] == ["--control-fd"]:
+            with socket.socket(fileno=int(command[1])) as control:
+                os.set_inheritable(control.fileno(), False)
+                control.settimeout(3)
+                _verify_scope_launch(name, expected_invocation=invocation)
+                control.sendall(b"V")
+                if control.recv(1) != b"R":
+                    return 1
+            command = command[2:]
+        else:
+            _verify_scope_launch(name, expected_invocation=invocation)
         if command:
             os.execvpe(command[0], command, os.environ)  # windows-footgun: ok — Linux systemd entry point
     except (ScopeVerificationError, OSError):

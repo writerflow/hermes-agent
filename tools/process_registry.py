@@ -6,12 +6,14 @@ Nothing runs on the host unless TERMINAL_ENV=local; other backends run in their 
 
 import codecs
 from contextlib import suppress
+from functools import partial
 import json
 import logging
 import os
 import platform
 import shlex
 import signal
+import socket
 import stat
 import subprocess
 import tempfile
@@ -45,7 +47,7 @@ from tools.process_registry_results import load_completed_results, save_complete
 from tools.process_registry_env_log import fallback_exit_code, log_delta_command, parse_log_delta_reply
 from tools.process_registry_wsl import _is_wsl_launcher_command
 from tools.process_registry_wait import max_wait_timeout, process_deadline_floor
-from tools.work_scope import OOM_POLICY, ScopeProbeFailure, probe_payload
+from tools.work_scope import OOM_POLICY, ScopeProbeFailure, held_scope_payload, probe_payload
 
 logger = logging.getLogger(__name__)
 
@@ -1104,25 +1106,44 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
                 logger.debug("Could not resolve environment temp dir: %s", exc)
         return tempfile.gettempdir()
 
-    def _scope_argv(self, session: ProcessSession, safe_command: str, unit_suffix: str, label: str) -> list[str]:
-        """Login-shell argv for *safe_command* (parity with LocalEnvironment: rc files
-        sourced, user tools on PATH), wrapped in a transient systemd scope when we are
-        the supervised gateway (own cgroup: an OOM kills only the worker, not the
-        gateway and its messaging control plane)."""
+    def _spawn_local_command(self, session, safe_command, label, spawn, env, **kwargs):
+        """Start the login shell, holding a scoped shell behind a private gate."""
         argv = [_find_shell(), "-lic", f"set +m; {safe_command}"]
-        # This applies to both pipe mode and the PTY path above. See #70716.
         in_supervised_gateway = _IS_LINUX and _is_supervised_gateway_process()
         if in_supervised_gateway and _systemd_run_user_scope_available():
-            scoped = _build_systemd_scope_argv(argv, unit_suffix=unit_suffix)
-            session.systemd_unit = f"hermes-worker-{unit_suffix}.scope"
-            return scoped
+            return self._spawn_verified_scope(session, argv, spawn, env, kwargs)
         if in_supervised_gateway:
             # Under a supervisor but no private cgroup: a worker OOM can still take
             # the whole gateway down.
             logger.debug(
                 "%s background executor not isolated in a systemd scope "
                 "(systemd-run --user unavailable); worker shares the gateway cgroup.", label)
-        return argv
+        return spawn(argv, env=env, **kwargs)
+
+    @staticmethod
+    def _spawn_verified_scope(session, argv, spawn, env, kwargs):
+        name = f"hermes-worker-{session.id}.scope"
+        env = systemd_user_bus_env(env)
+        env.pop("INVOCATION_ID", None)
+        try:
+            owner, launcher = socket.socketpair()
+            with owner, launcher:
+                scoped = _build_systemd_scope_argv(
+                    held_scope_payload(name, launcher.fileno(), argv), unit_suffix=session.id,
+                )
+                scoped[1:1] = ["--property", f"OOMPolicy={OOM_POLICY}"]
+                owner.settimeout(3)
+                proc = spawn(scoped, env=env, pass_fds=(launcher.fileno(),), **kwargs)
+                launcher.close()
+                if owner.recv(1) != b"V":
+                    raise OSError("launcher did not confirm placement")
+                owner.sendall(b"R")
+        except Exception as exc:
+            # Closing the gate cannot undo an uncertain move. Do not publish a
+            # unit name to the registry or authorize a second launch.
+            raise RestartSafeScopeUnavailable("background scope placement was not verified") from exc
+        session.systemd_unit = name
+        return proc
 
     @staticmethod
     def _spawn_env(env_vars: dict) -> dict:
@@ -1156,15 +1177,21 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
             from winpty import PtyProcess as _PtyProcessCls
         else:
             from ptyprocess import PtyProcess as _PtyProcessCls
-        pty_argv = self._scope_argv(session, safe_command, session.id, "PTY")
+        def spawn_pty(argv, *, pass_fds=(), **kwargs):
+            if pass_fds:
+                # ptyprocess preserves the fd at fork but unlike Popen it
+                # does not clear CLOEXEC. Do that only in the child.
+                kwargs.update(pass_fds=pass_fds, preexec_fn=partial(os.set_inheritable, pass_fds[0], True))
+            return _PtyProcessCls.spawn(argv, **kwargs)
+
         pty_env = self._spawn_env(env_vars)
-        if session.systemd_unit:
-            pty_env = systemd_user_bus_env(pty_env)
         # A PTY is a real TTY, so pager-happy tools (git log/diff, man) WILL page and
         # hang waiting for `q` — default them to cat, honoring any pager the user set.
         pty_env.setdefault("GIT_PAGER", "cat")
         pty_env.setdefault("PAGER", "cat")
-        pty_proc = _PtyProcessCls.spawn(pty_argv, cwd=session.cwd, env=pty_env, dimensions=(30, 120))
+        pty_proc = self._spawn_local_command(
+            session, safe_command, "PTY", spawn_pty, pty_env, cwd=session.cwd, dimensions=(30, 120),
+        )
         self._own_pty_job(session, pty_proc)
         session.pid = pty_proc.pid
         session.host_start_time = self._safe_host_start_time(session.pid)
@@ -1205,11 +1232,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
                     logger.warning("PTY spawn failed (%s), falling back to pipe mode", e)
         # Pipe path (non-PTY or PTY fallback).
         _popen_kwargs = {"creationflags": windows_hide_flags()} if _IS_WINDOWS else {}
-        spawn_argv = self._scope_argv(session, record_exit_command(log, safe_command) if log else safe_command,
-                                      session.id, "Local")
         spawn_env = self._spawn_env(env_vars)
-        if session.systemd_unit:
-            spawn_env = systemd_user_bus_env(spawn_env)
         # start_new_session is REQUIRED with systemd-run --scope too: the scope does not
         # give the worker a new session, so from an interactive TUI the worker would
         # share the foreground process group and background spawns would stop the whole
@@ -1217,8 +1240,10 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
         # the scope attaches to the invoked process, not the spawning session.
         output = open_output_log(log) if log else subprocess.PIPE
         try:
-            proc = self._spawn_job(
-                session, spawn_argv, persist_on_release, text=True, cwd=session.cwd, env=spawn_env,
+            proc = self._spawn_local_command(
+                session, record_exit_command(log, safe_command) if log else safe_command, "Local",
+                lambda argv, **kw: self._spawn_job(session, argv, persist_on_release, **kw),
+                spawn_env, text=True, cwd=session.cwd,
                 encoding="utf-8", errors="replace", stdout=output, stderr=subprocess.STDOUT,
                 stdin=subprocess.DEVNULL, **_popen_kwargs)
         finally:
