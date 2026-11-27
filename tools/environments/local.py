@@ -1334,7 +1334,7 @@ class LocalEnvironment(BaseEnvironment):
             with contextlib.suppress(Exception):
                 proc.kill()
         finally:
-            foreground_scope.report_cleanup(proc)
+            foreground_scope.cleanup_original(proc)
 
     def _update_cwd(self, result: dict):
         """Base cwd extraction, then one line for the agent when a scoped command failed on the task limit."""

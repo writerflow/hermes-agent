@@ -159,7 +159,7 @@ class _FixturePin:
     def close(self):
         pass
 
-    def cleanup_incomplete_reason(self):
+    def drain(self):
         return None
 
 
@@ -851,10 +851,70 @@ class TestScopeLifecycle:
         assert result["returncode"] == 124, result
         assert marker.is_file(), "timed out before the admitted payload started"
         assert stopped == []
-        assert (controls / "cgroup.freeze").read_bytes() == b""
+        assert (controls / "cgroup.freeze").read_bytes() == (b"0" if populated else b"")
         assert (controls / "cgroup.kill").read_bytes() == b""
         reports = [record.getMessage() for record in caplog.records if record.name == fs.__name__]
         assert any("cleanup incomplete: original scope still populated" in report for report in reports) == populated
+
+    @pytest.mark.parametrize("member_owned", [True, False])
+    def test_timeout_checks_frozen_recursive_members_before_stopping_original(
+        self, member_owned, worker_host, fg_config, stub, make_env, monkeypatch, tmp_path, caplog,
+    ):
+        fg_config()
+        stopped = self._spy_stop(monkeypatch)
+        marker = tmp_path / "started"
+        original, replacement = tmp_path / "original", tmp_path / "current"
+        (replacement / "child").mkdir(parents=True)
+        for name in ("events", "freeze", "kill", "procs", "child/cgroup.procs"):
+            path = name if name.startswith("child/") else f"cgroup.{name}"
+            (replacement / path).touch()
+        child_pid = 2**30
+        real_pread = os.pread
+
+        def pin_original(proc, unit, invocation_id, anchor_pid):
+            scope_path = f"/app.slice/{unit}"
+            (replacement / "cgroup.procs").write_text(f"{anchor_pid}\n")
+            (replacement / "child/cgroup.procs").write_text(f"{child_pid}\n")
+            with ExitStack() as files:
+                directory = os.open(replacement, os.O_DIRECTORY)
+                files.callback(os.close, directory)
+                fds = []
+                for name, access in (("events", os.O_RDONLY), ("freeze", os.O_WRONLY), ("kill", os.O_WRONLY)):
+                    fd = os.open(f"cgroup.{name}", access, dir_fd=directory)
+                    files.callback(os.close, fd)
+                    fds.append(fd)
+                events, freeze, kill = fds
+                replacement.rename(original)
+                replacement.mkdir()
+                for name in ("freeze", "kill"):
+                    (replacement / f"cgroup.{name}").touch()
+
+                def cgroup_events(fd, size, offset):
+                    if fd != events:
+                        return real_pread(fd, size, offset)
+                    frozen = (original / "cgroup.freeze").read_bytes() == b"1"
+                    drained = (original / "cgroup.kill").read_bytes() == b"1"
+                    return f"populated {int(not drained)}\nfrozen {int(frozen)}\n".encode()
+
+                monkeypatch.setattr(os, "pread", cgroup_events)
+                frames = {anchor_pid: (1, 11), child_pid: (anchor_pid if member_owned else 1, 12)}
+                monkeypatch.setattr(fs, "_process_parent_birth", frames.__getitem__)
+                monkeypatch.setattr(fs, "_unified_membership", lambda pid: scope_path + ("/child" if pid == child_pid else ""))
+                monkeypatch.setattr(fs, "_fd_mount_id", lambda fd: 17)
+                return fs._PinnedScope("boot", (proc.pid, 10), (anchor_pid, 11),
+                                       ("bus", ":1.2", scope_path, "12" * 16, 1),
+                                       (17, 1), directory, events, freeze, kill, files.pop_all())
+
+        monkeypatch.setattr(fs, "_pin_original", pin_original)
+        result = make_env().execute(f"touch '{marker}'; exec sleep 30", resource_scope=True, timeout=2)
+        assert result["returncode"] == 124 and marker.is_file(), result
+        assert stopped == []
+        assert (original / "cgroup.kill").read_bytes() == (b"1" if member_owned else b"")
+        assert (original / "cgroup.freeze").read_bytes() == b"0"
+        assert (replacement / "cgroup.freeze").read_bytes() == b""
+        assert (replacement / "cgroup.kill").read_bytes() == b""
+        reports = [record.getMessage() for record in caplog.records if record.name == fs.__name__]
+        assert any("cleanup incomplete" in report for report in reports) is not member_owned
 
     def test_timeout_stops_the_whole_scope(self, worker_host, fg_config, real_systemd_stub, make_env, monkeypatch):
         fg_config()

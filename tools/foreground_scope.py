@@ -24,6 +24,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import time
 import uuid
 from contextlib import ExitStack, suppress
 from dataclasses import dataclass
@@ -56,6 +57,7 @@ _WRAPPER_FAILURE = re.compile(r"Failed to (connect to (the )?(user )?bus|create 
                               r"connect to user scope bus): [^\r\n]+", re.IGNORECASE)
 _MAX_WRAPPER_STDERR = 8192
 _ADMISSION_TIMEOUT = 5.0
+_CLEANUP_TIMEOUT = 0.75
 _CREDENTIALS = struct.Struct("iII")  # Linux struct ucred: pid, uid, gid
 _ANCHOR_PID = struct.Struct("=I")
 # Record that the post-placement helper ran before allowing any payload code.
@@ -183,19 +185,49 @@ class _PinnedScope:
     def close(self) -> None:
         self.files.close()
 
-    def cleanup_incomplete_reason(self) -> str | None:
-        # Observe the original subtree through its already-open descriptor.
-        # A fresh read by name could instead report a replacement's state.
+    def _events(self) -> tuple[bytes, bytes]:
+        rows = [row.split() for row in os.pread(self.events, 4096, 0).splitlines()]
+        values = []
+        for key in (b"populated", b"frozen"):
+            (row,) = [row for row in rows if row[:1] == [key]]
+            if len(row) != 2 or row[1] not in (b"0", b"1"):
+                raise ValueError("invalid scope event")
+            values.append(row[1])
+        return values[0], values[1]
+
+    def _wait_for_event(self, index: int, value: bytes, deadline: float) -> bool:
+        while self._events()[index] != value:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            time.sleep(min(remaining, 0.01))
+        return True
+
+    def drain(self) -> str | None:
+        # Admission owns these FDs. No fresh unit or path resolution may grant
+        # authority; an invalidated original descriptor only permits refusal.
         try:
-            rows = os.pread(self.events, 4096, 0).splitlines()
-        except OSError:
-            rows = []
-        populated = [row.split() for row in rows if row.split()[:1] == [b"populated"]]
-        if populated == [[b"populated", b"0"]]:
-            return None
-        if populated == [[b"populated", b"1"]]:
-            return "original scope still populated"
-        return "original scope state unverified"
+            populated, frozen = self._events()
+            if populated == b"0":
+                return None
+            if frozen != b"0":
+                return "original scope already frozen"
+            try:
+                _write_control(self.freeze, b"1")
+                deadline = time.monotonic() + _CLEANUP_TIMEOUT
+                if not self._wait_for_event(1, b"1", deadline):
+                    return "original scope still populated; freeze unconfirmed"
+                if not _verified_frozen_members(self, deadline) or self._events()[1] != b"1":
+                    return "original scope member provenance unverified"
+                _write_control(self.kill, b"1")
+                if not self._wait_for_event(0, b"0", time.monotonic() + _CLEANUP_TIMEOUT):
+                    return "original scope still populated after teardown"
+            finally:
+                # Always release our own freeze request, even on refusal.
+                _write_control(self.freeze, b"0")
+        except (OSError, ValueError, LookupError, RecursionError):
+            return "original scope state unverified"
+        return None
 
 
 def _read_placement(pid: int, unit: str, env: Mapping[str, str]) -> tuple[str, str, str, str, int]:
@@ -323,6 +355,65 @@ def _process_parent_birth(pid: int) -> tuple[int, int]:
     return int(fields[1]), int(fields[19])
 
 
+def _write_control(fd: int, value: bytes) -> None:
+    if os.pwrite(fd, value, 0) != len(value):
+        raise OSError("incomplete scope control write")
+
+
+def _member_snapshot(directory: int, path: str, mount: int, deadline: float,
+                     members: dict[int, tuple[int, int]]) -> None:
+    if time.monotonic() >= deadline or _fd_mount_id(directory) != mount:
+        raise ValueError("scope traversal unverified")
+    fd = os.open("cgroup.procs", os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=directory)
+    with os.fdopen(fd, encoding="ascii") as file:
+        for line in file:
+            pid = int(line)
+            if time.monotonic() >= deadline or pid <= 0 or pid in members:
+                raise ValueError("scope membership changed")
+            snapshot = _process_parent_birth(pid)
+            if _unified_membership(pid) != path or _process_parent_birth(pid) != snapshot:
+                raise ValueError("scope process identity changed")
+            members[pid] = snapshot
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    with os.scandir(directory) as entries:
+        for entry in entries:
+            if entry.is_dir(follow_symlinks=False):
+                child = os.open(entry.name, flags, dir_fd=directory)
+                try:
+                    _member_snapshot(child, f"{path}/{entry.name}", mount, deadline, members)
+                finally:
+                    os.close(child)
+
+
+def _verified_frozen_members(scope: _PinnedScope, deadline: float) -> bool:
+    path, mount = scope.placement[2], scope.handle[0]
+    members: dict[int, tuple[int, int]] = {}
+    _member_snapshot(scope.directory, path, mount, deadline, members)
+    anchor, birth = scope.anchor
+    if anchor not in members or members[anchor][1] != birth:
+        return False
+    owned = {anchor}
+    launcher, birth = scope.launcher
+    if launcher in members and members[launcher][1] == birth:
+        owned.add(launcher)
+    for pid in members:
+        chain = set()
+        while pid not in owned:
+            if pid not in members or pid in chain or time.monotonic() >= deadline:
+                return False
+            chain.add(pid)
+            parent, birth = members[pid]
+            if parent not in members or members[parent][1] > birth:
+                return False
+            pid = parent
+        owned.update(chain)
+    # A freeze does not prevent external cgroup writers from moving a process.
+    # Reject any drift we observe; this is not a sandbox for other writers.
+    current: dict[int, tuple[int, int]] = {}
+    _member_snapshot(scope.directory, path, mount, deadline, current)
+    return current == members and time.monotonic() < deadline
+
+
 def _verify_held_members(directory: int, path: str, launcher: tuple[int, int],
                          anchor: tuple[int, int]) -> bool:
     pid, birth = launcher
@@ -445,11 +536,11 @@ class _HeldAdmission:
                 self._original.close()
                 self._original = None
 
-    def report_cleanup(self, unit: str) -> None:
+    def cleanup_original(self, unit: str) -> None:
         with self._fence:
             if self._original is None:
                 return
-            reason = self._original.cleanup_incomplete_reason()
+            reason = self._original.drain()
         if reason is not None:
             logger.warning("Foreground scope %s: cleanup incomplete: %s", unit, reason)
 
@@ -568,9 +659,9 @@ def cancel_admission(proc: object) -> bool:
     return admission is not None and admission.cancel()
 
 
-def report_cleanup(proc: object) -> None:
+def cleanup_original(proc: object) -> None:
     if (admission := getattr(proc, "_hermes_scope_admission", None)) is not None:
-        admission.report_cleanup(scope_unit_of(proc))
+        admission.cleanup_original(scope_unit_of(proc))
 
 
 def wrapper_diagnostic(proc: subprocess.Popen, returncode: int | None) -> tuple[str, bool]:
