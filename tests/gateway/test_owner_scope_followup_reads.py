@@ -51,6 +51,43 @@ def test_cron_create_other_reads_are_off_loop(mux, monkeypatch, site):
     assert all(ident != loop_ident for _, ident in observed), f'cron {site} read on owner loop'
 
 
+def test_cron_create_refuses_drain_during_job_read(mux, monkeypatch):
+    from cron import jobs
+    from gateway import session_cron
+    from gateway.session_local_recovery import local_identity
+    from hermes_state_keys import CRON_PRINCIPAL_ID, cron_request_id
+    from hermes_state_runtime import RuntimeStoreError
+
+    runner, homes, loop, _ = mux
+    authority = runner.session_authorities.require(homes['beta'])
+    with jobs.use_cron_store(homes['beta']):
+        job = jobs.create_job(prompt='report', schedule='every 1h', deliver='local', model='fixture')
+    sid = local_identity(authority.profile_id, CRON_PRINCIPAL_ID, cron_request_id(job['id'], 'drain'))
+    entered, release = threading.Event(), threading.Event()
+    real = jobs.get_job
+
+    def held_read(job_id):
+        entered.set()
+        if not release.wait(30):
+            raise TimeoutError('cron job test release')
+        return real(job_id)
+
+    monkeypatch.setattr(jobs, 'get_job', held_read)
+    future = asyncio.run_coroutine_threadsafe(session_cron.operation(authority, 'submit', {
+        'job_id': job['id'], 'request_id': 'drain', 'extra_prompt': None}), loop)
+    try:
+        assert entered.wait(20), 'cron submit did not reach job reader'
+        runner._draining = True
+    finally:
+        release.set()
+    try:
+        with pytest.raises(RuntimeStoreError, match='runtime_draining'):
+            future.result(timeout=30)
+        assert authority.db.get_session(sid) is None, 'draining attempt created a session'
+    finally:
+        runner._draining = False
+
+
 def test_cron_create_job_read_is_off_loop(mux, monkeypatch):
     from cron import jobs
     from gateway import session_cron
