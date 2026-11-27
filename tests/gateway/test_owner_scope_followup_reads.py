@@ -55,6 +55,46 @@ def test_cron_create_other_reads_are_off_loop(mux, monkeypatch, site):
     assert all(ident != loop_ident for _, ident in observed), f'cron {site} read on owner loop'
 
 
+def test_cron_create_exact_retry_reads_identity_off_loop_without_job(mux, monkeypatch):
+    from cron import jobs
+    from gateway import run, session_cron
+    from gateway.session_local_recovery import local_identity
+    from hermes_state_keys import CRON_PRINCIPAL_ID, cron_request_id
+
+    runner, homes, loop, call = mux
+    authority = runner.session_authorities.require(homes['beta'])
+    with jobs.use_cron_store(homes['beta']):
+        job = jobs.create_job(prompt='report', schedule='every 1h', deliver='local', model='fixture')
+    params = {'job_id': job['id'], 'request_id': 'retry', 'extra_prompt': None}
+    original = call(session_cron.operation(authority, 'submit', params))
+    sid = local_identity(authority.profile_id, CRON_PRINCIPAL_ID, cron_request_id(job['id'], 'retry'))
+    assert original['session_id'] == sid
+    reads = []
+    real = authority.db._read_one
+
+    def probe(sql, params=()):
+        import inspect
+        stack = {frame.function for frame in inspect.stack()}
+        if '_create' in stack and 'restore_local_session' not in stack and 'FROM sessions' in sql and sid in params:
+            reads.append(threading.get_ident())
+        return real(sql, params)
+
+    def unexpected(*args, **kwargs):
+        raise AssertionError('exact retry read job or config')
+
+    async def loop_thread():
+        return threading.get_ident()
+
+    loop_ident = call(loop_thread())
+    monkeypatch.setattr(authority.db, '_read_one', probe)
+    monkeypatch.setattr(jobs, 'get_job', unexpected)
+    monkeypatch.setattr(run, '_load_gateway_config', unexpected)
+    retry = call(session_cron.operation(authority, 'submit', params))
+    assert retry == original
+    assert reads, 'exact retry did not reach session identity read'
+    assert all(ident != loop_ident for ident in reads), 'exact retry identity read on owner loop'
+
+
 def test_cron_create_refuses_drain_during_job_read(mux, monkeypatch):
     from cron import jobs
     from gateway import session_cron
