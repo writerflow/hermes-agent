@@ -377,6 +377,45 @@ def test_a_recovered_pid_that_dies_mid_kill_reports_the_failed_scope_stop(monkey
     assert session.id in registry._finished  # keeps its unit for a retry
 
 
+@pytest.mark.parametrize("fate", ["running", "gone", "reused"])
+@pytest.mark.parametrize("exits_after_recovery", [False, True])
+def test_recovered_foreground_handoff_cannot_stop_without_original_handle(
+    monkeypatch, tmp_path, fate, exits_after_recovery,
+):
+    old_owner, new_owner = ProcessRegistry(), ProcessRegistry()
+    monkeypatch.setattr(module, "_checkpoint_path", lambda: tmp_path / "processes.json")
+    monkeypatch.setattr(old_owner, "_take_handoff_group", lambda *_: None)
+    monkeypatch.setattr(old_owner, "_safe_host_start_time", lambda _: 123)
+
+    def track(session, *_):
+        old_owner._running[session.id] = session
+        old_owner._write_checkpoint()
+
+    monkeypatch.setattr(old_owner, "_track_started", track)
+    proc = cast(Any, SimpleNamespace(pid=4242, _hermes_scope_admission=object()))
+    original = old_owner.adopt_local(proc, command="cmd", cwd=None, task_id="fg-task")
+    observed_fate = "running" if exits_after_recovery else fate
+    monkeypatch.setattr(new_owner, "_detached_host_fate", lambda *_: observed_fate)
+    effects = []
+    monkeypatch.setattr(new_owner, "_signal_kill", lambda *_: effects.append("PID"))
+    monkeypatch.setattr(new_owner, "_stop_scope", lambda *_: effects.append("scope") or True)
+    monkeypatch.setattr(new_owner, "_post_kill_survivors", lambda *_: [])
+
+    assert new_owner.recover_from_checkpoint() == 1
+    observed_fate = fate
+    for _ in range(2):
+        result = new_owner.kill_process(original.id)
+        assert effects == []
+        assert result["status"] == "error"
+        assert "original scope handle unavailable" in result["error"]
+    assert new_owner.kill_all(task_id="fg-task") == 0
+    assert effects == []
+    ProcessRegistry()._write_checkpoint()  # another interpreter sharing the profile
+    successor = ProcessRegistry()
+    monkeypatch.setattr(successor, "_detached_host_fate", lambda *_: fate)
+    assert successor.recover_from_checkpoint() == 1
+
+
 def test_bulk_cleanup_does_not_count_a_failed_scope_stop_and_retries_it(monkeypatch):
     """The root exits after ``kill_all`` picked the session, and the scope stop fails."""
     registry = ProcessRegistry()

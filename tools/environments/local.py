@@ -1025,7 +1025,7 @@ def _leader_is_ours(pgid, expected_start) -> bool:
         return True
 
 
-def _kill_process_group_posix(proc) -> None:
+def _kill_process_group_posix(proc, *, sweep_detached: bool = True) -> None:
     """TERM the group, wait, KILL, then sweep setsid escapees. Descendants are
     snapshotted BEFORE the first signal — once the wrapper dies they reparent to
     init — and we wait on the group, not the wrapper, which can exit before
@@ -1047,14 +1047,15 @@ def _kill_process_group_posix(proc) -> None:
         descendants = []
         try:
             import psutil
-            descendants = psutil.Process(proc.pid).children(recursive=True)
+            if sweep_detached:
+                descendants = psutil.Process(proc.pid).children(recursive=True)
         except Exception:
             pass
         _sweep_escaped_descendants(descendants, pgid)
         return
     try:  # psutil children snapshot; empty on any failure (must never break the kill)
         import psutil
-        descendants = psutil.Process(proc.pid).children(recursive=True)
+        descendants = psutil.Process(proc.pid).children(recursive=True) if sweep_detached else []
     except Exception:
         descendants = []
     if pgid == os.getpgrp():
@@ -1240,7 +1241,8 @@ class LocalEnvironment(BaseEnvironment):
             args, run_env = scoped.argv, scoped.env
         # Not spawn_owned: an awaited command needs no spawn-ledger entry; own_process_groups below hands
         # its group to the owner-death supervisor and _wait_for_process releases it.
-        proc = subprocess.Popen(
+        popen = foreground_scope.spawn_scoped if scoped is not None else subprocess.Popen
+        proc = popen(
             args, text=True, env=run_env, encoding="utf-8", errors="replace",
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             stdin=subprocess.PIPE if stdin_data is not None else subprocess.DEVNULL,
@@ -1248,7 +1250,7 @@ class LocalEnvironment(BaseEnvironment):
             start_new_session=True, cwd=self.cwd,
             **({"creationflags": windows_hide_flags()} if _IS_WINDOWS else {}))
         if scoped is not None:
-            # The wrapper execs in place: the Popen pid, group and start time are the command's own.
+            # The wrapper execs the held launcher in place; the launcher leads the command's group.
             proc._hermes_scope_unit = scoped.unit
             proc._hermes_scope_retry = (cmd_string, login, timeout, stdin_data, run_env)
         if not _IS_WINDOWS:
@@ -1264,6 +1266,8 @@ class LocalEnvironment(BaseEnvironment):
             # platform, macOS included.
             from gateway.status import get_process_start_time
             proc._hermes_pgid_start = get_process_start_time(proc.pid)
+        if scoped is not None:
+            foreground_scope.start_admission(proc, scoped.unit)
         if stdin_data is not None:
             _pipe_stdin(proc, stdin_data)
         return proc
@@ -1280,15 +1284,22 @@ class LocalEnvironment(BaseEnvironment):
             if not foreground_scope.scope_unit_of(proc):
                 return result
             cmd_string, login, timeout, stdin_data, spawn_env = proc._hermes_scope_retry
-            if foreground_scope.scope_never_started(result.get("returncode"), result.get("output", ""), self._cwd_marker):
+            diagnostic, pre_start = foreground_scope.wrapper_diagnostic(proc, result.get("returncode"))
+            if pre_start:
                 foreground_scope.warn_bus_lost(spawn_env)
                 fallback = self._run_bash(cmd_string, login=login, timeout=timeout, stdin_data=stdin_data)
                 if "output" in kwargs:
                     kwargs["output"] = _new_output_collector(fallback, kwargs.get("bounded_capture", False))
                 return self._wait_for_process(fallback, *args, **kwargs)
+            if diagnostic:
+                result["output"] = "\n".join(filter(None, (diagnostic, result.get("output"))))
             result["hermes_fg_scope"] = proc._hermes_scope_unit
             return result
         finally:
+            if foreground_scope.scope_unit_of(proc):
+                foreground_scope.close_spawn_streams(proc)
+                if not getattr(proc, "_hermes_scope_adopted", False):
+                    foreground_scope.close_admission(proc)
             if (owned_pgid := getattr(proc, "_hermes_owned_pgid", None)) is not None:
                 proc._hermes_owned_pgid = None
                 release_process_groups([owned_pgid])
@@ -1311,15 +1322,19 @@ class LocalEnvironment(BaseEnvironment):
         return proc
 
     def _kill_process(self, proc):
-        """Kill the entire process group (all children), then the whole scope: it also reaps what escaped the
-        group (``setsid``) inside a foreground scope."""
+        """Kill the owned process tree; a requested scope name confers no cleanup authority."""
+        has_original = foreground_scope.cancel_admission(proc)
         try:
-            (_kill_process_windows if _IS_WINDOWS else _kill_process_group_posix)(proc)
+            if has_original:
+                # Detached members retain their verified parent for scope cleanup.
+                _kill_process_group_posix(proc, sweep_detached=False)
+            else:
+                (_kill_process_windows if _IS_WINDOWS else _kill_process_group_posix)(proc)
         except OSError:  # ProcessLookupError / PermissionError included
             with contextlib.suppress(Exception):
                 proc.kill()
-        if unit := foreground_scope.scope_unit_of(proc):
-            foreground_scope.stop_scope(unit)
+        finally:
+            foreground_scope.cleanup_original(proc)
 
     def _update_cwd(self, result: dict):
         """Base cwd extraction, then one line for the agent when a scoped command failed on the task limit."""
@@ -1328,8 +1343,10 @@ class LocalEnvironment(BaseEnvironment):
                 result.get("returncode"), result.get("output", ""))):
             result["output"] = f"{result['output']}\n{note}"
 
-    def _force_kill_process(self, proc):
-        """SIGKILL the whole group with no TERM grace or wait: the caller os._exit()s next."""
+    def _force_kill_process(self, proc, *, deadline=None):
+        """Force cleanup with no TERM grace: the caller os._exit()s next."""
+        # The group stop can end the ancestry evidence needed by the scope check.
+        foreground_scope.force_cleanup_original(proc, deadline)
         if _IS_WINDOWS:  # already a forced tree kill
             return self._kill_process(proc)
         with contextlib.suppress(OSError):

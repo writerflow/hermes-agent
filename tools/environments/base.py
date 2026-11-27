@@ -106,9 +106,9 @@ def _leave_foreground_spawn(env: "BaseEnvironment", spawned) -> bool:
         return _exit_fenced
 
 
-def _quiet_kill(kill: Callable, proc) -> None:
+def _quiet_kill(kill: Callable, proc, **kwargs) -> None:
     try:
-        kill(proc)
+        kill(proc, **kwargs)
     except Exception:
         logger.debug("exit-time kill of a foreground command failed", exc_info=True)
 
@@ -140,7 +140,9 @@ def kill_live_foreground_processes(*, now: bool = False) -> int:
         live = list(_live_foreground.values())
     remote = []
     for env, proc in live:
-        if isinstance(proc, subprocess.Popen):  # killpg/kill: never blocks
+        if isinstance(proc, subprocess.Popen) and getattr(proc, "_hermes_scope_admission", None) is not None:
+            _quiet_kill(env._force_kill_process, proc, deadline=deadline)
+        elif isinstance(proc, subprocess.Popen):  # unscoped killpg/kill
             _quiet_kill(env._force_kill_process, proc)
         else:
             remote.append(threading.Thread(target=_quiet_kill, args=(env._force_kill_process, proc), daemon=True))

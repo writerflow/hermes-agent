@@ -87,13 +87,12 @@ def _sweep_one(record: dict) -> tuple[bool, str | None]:
     return ours and not ProcessRegistry._host_pid_is_ours(pid, born), leftover
 
 
-def _sweep_left_behind(homes: list[Path], owner_pid: int) -> tuple[int, int, list[str]]:
-    """What the killed gateway's ``stop()`` would have killed (``kill_all(source="gateway_shutdown")``:
-    persisted jobs included): the host processes its checkpoints name as written by *owner_pid*.
+def _left_behind_records(homes: list[Path], owner_pid: int) -> tuple[list[dict], int]:
+    """Read the host processes the stopped gateway's checkpoints name as written by *owner_pid*.
     ``processes.json`` is shared by every interpreter on the home (an ACP editor's background
     commands too), so an entry another process wrote, or one with no ``owner_pid`` (written before
     it was recorded), is not this gateway's and is left alone.
-    ``(stopped, skipped, leftover scopes)``."""
+    """
     records, skipped = [], 0
     for home in homes:
         with suppress(OSError, ValueError):
@@ -102,11 +101,24 @@ def _sweep_left_behind(homes: list[Path], owner_pid: int) -> tuple[int, int, lis
             owned = [r for r in host if r.get("owner_pid") == owner_pid]
             records += owned
             skipped += len(host) - len(owned)
+    return records, skipped
+
+
+def _sweep_left_behind(records: list[dict]) -> tuple[int, list[str]]:
+    """Stop legacy background jobs left by a gateway that could not finish its own sweep."""
     if not records:
-        return 0, skipped, []
+        return 0, []
     with ThreadPoolExecutor(max_workers=min(8, len(records)), thread_name_prefix="update-force-sweep") as pool:
         results = list(pool.map(_sweep_one, records))
-    return sum(stopped for stopped, _ in results), skipped, [unit for _, unit in results if unit]
+    return sum(stopped for stopped, _ in results), [unit for _, unit in results if unit]
+
+
+def _original_scope_hold(records: list[dict]) -> str | None:
+    sessions = [str(r.get("session_id") or "unknown session")
+                for r in records if r.get("original_scope_required") is True]
+    if sessions:
+        return f"foreground cleanup incomplete for {', '.join(dict.fromkeys(sessions))}: original scope handle unavailable"
+    return None
 
 
 def _live_work(entry: dict) -> list | None:
@@ -197,16 +209,21 @@ def _stop_one(token: dict, entry: dict, lock: threading.Lock) -> tuple[bool, str
     alive = bool(_wait_gone([entry["pid"]], FORCE_KILL_AFTER_S, born))
     if supervisor is not None:
         supervisor.join(max(0.0, deadline - time.monotonic()))
-    if alive or (supervisor is not None and supervisor.is_alive()):
+    escalated = alive or (supervisor is not None and supervisor.is_alive())
+    if escalated:
         print(f"  ⚠ gateway PID {entry['pid']} still stopping {FORCE_KILL_AFTER_S:.0f}s after the stop — killing it",
               flush=True)
         _kill(entry)  # a unit: SIGKILL to every process in its cgroup, so the stop job can settle
-        swept, skipped, leftover = _sweep_left_behind(homes, entry["pid"])  # its scopes/sessions: outside that cgroup
+        records, skipped = _left_behind_records(homes, entry["pid"])
+        hold = _original_scope_hold(records)
+        swept, leftover = _sweep_left_behind([r for r in records if r.get("original_scope_required") is not True])
         if swept:
             print(f"  ⏹ {_names([entry])}: also stopped {swept} background process(es) it left behind", flush=True)
         if skipped:
             print(f"  ℹ {_names([entry])}: left {skipped} recorded background process(es) running that another "
                   "process (or an older Hermes) recorded", flush=True)
+        if hold:
+            return True, hold
         if leftover:
             return True, (f"background scope(s) {', '.join(leftover)} of gateway PID {entry['pid']} still running "
                           f"after SIGKILL (check `systemctl --user status {leftover[0]}`)")
@@ -218,6 +235,10 @@ def _stop_one(token: dict, entry: dict, lock: threading.Lock) -> tuple[bool, str
         supervisor.join(_STOP_JOB_SETTLE_S)
         if supervisor.is_alive():
             return True, f"{_supervisor_name(entry)} is still stopping gateway PID {entry['pid']} ({_check_hint(entry)})"
+    if not escalated:
+        records, _ = _left_behind_records(homes, entry["pid"])
+        if hold := _original_scope_hold(records):
+            return True, hold
     return (False, failed[0]) if failed else None
 
 

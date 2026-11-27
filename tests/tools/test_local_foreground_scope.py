@@ -18,19 +18,26 @@ import ast
 import json
 import os
 import re
+import shlex
 import shutil
+import socket
 import stat
 import subprocess
 import sys
 import textwrap
 import time
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack
+from contextvars import copy_context
 from dataclasses import dataclass
 from pathlib import Path
+from threading import Event
 
 import pytest
 
 from tools import foreground_scope as fs
 from tools import process_registry as pr
+from tools.environments import local as local_env
 from tools.environments.local import LocalEnvironment
 
 pytestmark = pytest.mark.spawns_gateway_lookalike  # host shapes run real `gateway run` lookalike holders
@@ -71,10 +78,17 @@ class SystemdStub:
     SCRIPTS = {
         # run the wrapped command in place, as the real --scope mode does
         "passthrough": 'exec "${args[@]:$((sep+1))}"',
+        "unplaced": 'exec "${args[@]:$((sep+1))}"',
         # the bus is gone: the wrapper fails before the command could start
         "no_bus": 'echo "Failed to connect to bus: No such file or directory" >&2; exit 1',
-        # the command did run, and the wrapper still reports failure
-        "ran_then_fail": '"${args[@]:$((sep+1))}"; exit 1',
+        "lost_create_reply": 'echo "Failed to start transient scope unit: Connection timed out" >&2; exit 1',
+        "unit_exists": 'echo "Failed to start transient scope unit: Unit already exists" >&2; exit 1',
+        "multiline_create_error": ('echo "Failed to start transient scope unit: Connection dropped" >&2; '
+                                   'echo "Failed to connect to bus: No such file or directory" >&2; exit 1'),
+        # As with systemd-run, exec in place; the payload itself reports failure.
+        "ran_then_fail": 'args[-1]="trap \'exit 1\' EXIT; ${args[-1]}"; exec "${args[@]:$((sep+1))}"',
+        "ran_then_bus_error": ('"${args[@]:$((sep+1))}"; '
+                               'echo "Failed to connect to bus: No such file or directory" >&2; exit 1'),
     }
 
     def __init__(self, root: Path, mode: str = "passthrough", *, real: str | None = None):
@@ -129,6 +143,8 @@ def stub_factory(tmp_path, monkeypatch):
         # Host capability, not identity: seed the probe's own cache instead of replacing the probe.
         monkeypatch.setattr(pr, "_SYSTEMD_SCOPE_AVAILABLE", True)
         monkeypatch.setattr(pr, "_SYSTEMD_SCOPE_PROBED_AT", time.monotonic())
+        if real is None and mode in ("passthrough", "ran_then_fail"):
+            monkeypatch.setattr(fs, "_pin_original", _fixture_pin)
         return stub
 
     return make
@@ -137,6 +153,23 @@ def stub_factory(tmp_path, monkeypatch):
 @pytest.fixture()
 def stub(stub_factory) -> SystemdStub:
     return stub_factory("passthrough")
+
+
+class _FixturePin:
+    def close(self):
+        pass
+
+    def is_empty(self):
+        return True
+
+    def drain(self, *, timeout, deadline=None, should_yield=None):
+        return None
+
+
+def _fixture_pin(*_):
+    # These tests exercise behavior after admission. The pin-specific tests
+    # exercise actual directory/control opens with a simulated manager/kernel.
+    return _FixturePin()
 
 
 @pytest.fixture()
@@ -361,7 +394,10 @@ class TestScopedCommand:
     def test_gateway_command_is_scoped(self, fg_config, stub, tmp_path):
         fg_config()
         result = run_as_gateway(tmp_path, f"""
+            from tests.tools.test_local_foreground_scope import _fixture_pin
+            from tools import foreground_scope as fs
             from tools.environments.local import LocalEnvironment
+            fs._pin_original = _fixture_pin
             LocalEnvironment.init_session = lambda self, *a, **k: None
             env = LocalEnvironment(cwd={str(tmp_path)!r}, timeout=60)
             r = env.execute("echo hi", resource_scope=True)
@@ -519,21 +555,585 @@ class TestPropertySet:
 # --------------------------------------------------------------------------- T4: kill, timeout, yield
 @pytest.mark.platforms("linux")
 class TestScopeLifecycle:
-    def _spy_stop(self, monkeypatch, result=True):
+    @pytest.mark.parametrize("cancel", [False, True], ids=["normal-exit", "timeout"])
+    def test_detached_child_keeps_owned_parent_until_scope_cleanup(
+        self, cancel, worker_host, fg_config, stub, make_env, tmp_path,
+    ):
+        fg_config()
+        script = tmp_path / "orphan.py"
+        script.write_text(textwrap.dedent("""\
+            import os, signal, socket, sys
+
+            parent = os.getppid()
+            intermediate = os.fork()
+            if intermediate:
+                os.waitpid(intermediate, 0)
+                if sys.argv[2] == 'timeout':
+                    signal.pause()
+                print('payload finished', flush=True)
+                sys.exit(17)
+            os.setsid()
+            if os.fork():
+                os._exit(0)
+            for fd in (0, 1, 2):
+                os.close(fd)
+            with socket.socket(socket.AF_UNIX) as sock:
+                sock.settimeout(10)
+                sock.connect(bytes.fromhex(sys.argv[1]))
+                sock.sendall(f'{os.getpid()} {parent}\\n'.encode())
+                if sock.recv(1) == b'?':
+                    sock.sendall(b'!')
+        """))
+        address = b"\0hermes-test-" + os.urandom(16).hex().encode()
+        command = "exec " + shlex.join([
+            sys.executable, str(script), address.hex(), "timeout" if cancel else "normal",
+        ])
+        with socket.socket(socket.AF_UNIX) as listener:
+            listener.settimeout(5)
+            listener.bind(address)
+            listener.listen(1)
+            result = make_env().execute(command, resource_scope=True, timeout=2 if cancel else 5)
+            assert result["returncode"] == (124 if cancel else 17), result
+            if not cancel:
+                assert result["output"].strip() == "payload finished"
+            connection, _ = listener.accept()
+            with connection, connection.makefile("rb") as info:
+                connection.settimeout(2)
+                child, anchor = map(int, info.readline().split())
+                _, parent, *_ = Path(f"/proc/{child}/stat").read_text().rsplit(")", 1)[1].split()
+                assert int(parent) == anchor, "detached child lost its original launcher ancestry"
+                connection.sendall(b"?")
+                assert connection.recv(1) == b"!"
+
+    @pytest.mark.parametrize("redirect", ["", " >&2"])
+    def test_payload_bus_diagnostic_does_not_trigger_fallback(self, redirect, worker_host, fg_config,
+                                                             stub, make_env, tmp_path):
+        fg_config()
+        counter = tmp_path / "counter"
+        diagnostic = "Failed to connect to bus: No such file or directory"
+        result = make_env().execute(
+            f"echo ran >> {counter}; echo '{diagnostic}'{redirect}; exit 1", resource_scope=True)
+        assert counter.read_text() == "ran\n"
+        assert result["returncode"] == 1
+        assert result["output"].strip() == diagnostic
+        assert len(stub.calls()) == 1
+
+    def test_launcher_bus_diagnostic_after_untrusted_helper_does_not_replay(self, worker_host, fg_config,
+                                                                          stub_factory, make_env, tmp_path):
+        fg_config()
+        stub = stub_factory("ran_then_bus_error")
+        counter = tmp_path / "counter"
+        result = make_env().execute(f"echo ran >> {counter}", resource_scope=True)
+        # The helper has the wrong sender PID; neither admission nor replay is allowed.
+        assert not counter.exists()
+        assert result["returncode"] == 1
+        assert len(stub.calls()) == 1
+
+    def test_post_job_helper_without_scope_membership_cannot_run_payload(
+        self, worker_host, fg_config, stub_factory, make_env, monkeypatch, tmp_path,
+    ):
+        fg_config()
+        stub = stub_factory("unplaced")
+        # The pass-through launcher execs the helper with the right PID but
+        # never creates a cgroup or puts the helper into an original object.
+        stopped = self._spy_stop(monkeypatch)
+        marker = tmp_path / "payload"
+        result = make_env().execute(f"touch {marker}", resource_scope=True, timeout=5)
+        assert not marker.exists(), result
+        assert result["returncode"] == 125
+        assert len(stub.calls()) == 1
+        assert stopped == []
+
+    @pytest.mark.parametrize("cancel", [False, True], ids=["release-once", "cancel-before-release"])
+    def test_held_payload_waits_for_original_scope_verification(
+        self, cancel, worker_host, fg_config, stub, make_env, monkeypatch, tmp_path,
+    ):
+        fg_config()
+        marker = tmp_path / "payload"
+        verifying, finish_verification = Event(), Event()
+        stopped = self._spy_stop(monkeypatch)
+        held = []
+
+        def pin_original(proc, unit, invocation_id, anchor_pid):
+            held.append(proc)
+            verifying.set()
+            assert finish_verification.wait(5), "verification barrier was not released"
+            return _FixturePin()
+
+        # Substitute only the manager/kernel object verification: run the actual
+        # launcher, helper, admission channel, and terminal waiter.
+        monkeypatch.setattr(fs, "_pin_original", pin_original)
+        env = make_env()
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            result = pool.submit(copy_context().run, env.execute, f"echo ran >> {marker}",
+                                 resource_scope=True, timeout=8)
+            try:
+                assert verifying.wait(5), (marker.exists(), result.result(timeout=10))
+                assert not marker.exists()
+                if cancel:
+                    # Force the cooperative PGID route to refuse. A rejected
+                    # group signal must not substitute for closing admission.
+                    monkeypatch.setattr(local_env, "_leader_is_ours", lambda *_: False)
+                    env._kill_process(held[0])
+            finally:
+                finish_verification.set()
+            reply = result.result(timeout=8)
+        if cancel:
+            assert not marker.exists(), reply
+            assert reply["returncode"] == 125
+        else:
+            assert marker.read_text() == "ran\n", reply
+            assert reply["returncode"] == 0
+        assert len(stub.calls()) == 1
+        assert stopped == []
+
+    @pytest.mark.parametrize("change", [None, "invocation", "membership", "generation", "control", "anchor"])
+    def test_held_launch_pins_controls_only_for_the_original_placement(
+        self, change, worker_host, fg_config, stub_factory, make_env, monkeypatch, tmp_path,
+    ):
+        fg_config()
+        invocation = "12" * 16
+        monkeypatch.setitem(SystemdStub.SCRIPTS, "placed", f'export INVOCATION_ID={invocation}; '
+                            + SystemdStub.SCRIPTS["passthrough"])
+        stub_factory("placed")
+        mount = tmp_path / "cgroup"
+        mount.mkdir()
+        placements = []
+        marker = tmp_path / "payload"
+
+        def placement(pid, unit, env):
+            path = f"/app.slice/{unit}"
+            cg = mount / path.lstrip("/")
+            if not placements:
+                cg.mkdir(parents=True)
+                (cg / "cgroup.type").write_text("domain\n")
+                children = Path(f"/proc/{pid}/task/{pid}/children").read_text().split()
+                anchor, = children
+                members = [str(pid)] if change == "anchor" else [str(pid), anchor]
+                (cg / "cgroup.procs").write_text("\n".join(members) + "\n")
+                for control in ("events", "freeze", "kill"):
+                    if (control, change) != ("kill", "control"):
+                        (cg / f"cgroup.{control}").touch()
+            elif change == "membership":
+                (cg / "cgroup.procs").write_text("")
+            elif change == "generation":
+                cg.rename(cg.with_suffix(".old"))
+                shutil.copytree(cg.with_suffix(".old"), cg)
+            placements.append(path)
+            assert not marker.exists(), "payload ran before the pin was verified"
+            current = "34" * 16 if change == "invocation" and len(placements) > 1 else invocation
+            original_id = cg.stat().st_ino if change != "generation" or len(placements) == 1 else cg.with_suffix(".old").stat().st_ino
+            return ("bus-id", ":1.2", path, current, original_id)
+
+        monkeypatch.setattr(fs, "_read_placement", placement, raising=False)
+        monkeypatch.setattr(fs, "_cgroup_mount", lambda: (17, str(mount)), raising=False)
+        monkeypatch.setattr(fs, "_unified_membership", lambda pid: placements[-1], raising=False)
+        # Fake the kernfs generation at the syscall boundary; directory/control
+        # opens (including the replacement) and the held-launch channel are real.
+        monkeypatch.setattr(fs, "_kernel_handle", lambda fd: (17, os.fstat(fd).st_ino), raising=False)
+        monkeypatch.setattr(fs, "_fd_mount_id", lambda fd: 17, raising=False)
+        reply = make_env().execute(f"echo ran >> {marker}", resource_scope=True, timeout=10)
+        if change is None:
+            assert reply["returncode"] == 0, reply
+            assert marker.read_text() == "ran\n"
+        else:
+            assert reply["returncode"] == 125, reply
+            assert not marker.exists()
+        assert len(placements) == (1 if change == "control" else 2)
+
+    @pytest.mark.parametrize("change", [None, "bus", "manager", "wrong-id-type"])
+    def test_placement_requires_one_bus_epoch_and_typed_generation(self, change, monkeypatch):
+        unit = "hermes-worker-fg-test.scope"
+        obj = "/org/freedesktop/systemd1/unit/hermes_2dworker_2dfg_2dtest_2escope"
+        systemd = "org.freedesktop.systemd1"
+        bus_id, owner = "a" * 32, ":1.7"
+        path, generation = f"/app.slice/{unit}", 4294967373
+        invocation = [18] * 16
+        read_scope = False
+
+        def reply(args, **kwargs):
+            nonlocal read_scope
+            destination, target, interface, member, *parameters = args[args.index("call") + 1:]
+            if member == "GetId":
+                signature, value = "s", "b" * 32 if read_scope and change == "bus" else bus_id
+            elif member == "GetNameOwner":
+                signature, value = "s", ":1.8" if read_scope and change == "manager" else owner
+            else:
+                assert destination == owner
+                if member == "GetUnitByPID":
+                    assert parameters == ["u", "12345"]
+                    signature, value = "o", obj
+                elif parameters == ["s", f"{systemd}.Unit"]:
+                    assert target == obj and member == "GetAll"
+                    signature, value = "a{sv}", {
+                        "Id": {"type": "s", "data": unit},
+                        "ActiveState": {"type": "s", "data": "active"},
+                        "Transient": {"type": "b", "data": True},
+                        "InvocationID": {"type": "ay", "data": invocation},
+                    }
+                else:
+                    assert target == obj and member == "GetAll" and parameters == ["s", f"{systemd}.Scope"]
+                    read_scope = True
+                    signature, value = "a{sv}", {
+                        "ControlGroup": {"type": "s", "data": path},
+                        "ControlGroupId": {"type": "x" if change == "wrong-id-type" else "t", "data": generation},
+                    }
+            return subprocess.CompletedProcess(args, 0, json.dumps({"type": signature, "data": [value]}).encode())
+
+        monkeypatch.setattr(fs, "locate_command", lambda _: type("Located", (), {"command": ("busctl",)})())
+        monkeypatch.setattr(fs.subprocess, "run", reply)
+        if change is None:
+            assert fs._read_placement(12345, unit, {}) == (bus_id, owner, path, "12" * 16, generation)
+        else:
+            with pytest.raises(ValueError):
+                fs._read_placement(12345, unit, {})
+
+    @pytest.mark.parametrize("mode", ["lost_create_reply", "unit_exists", "multiline_create_error"])
+    def test_create_call_failure_does_not_run_payload_unscoped(self, mode, worker_host, fg_config,
+                                                             stub_factory, make_env, monkeypatch, tmp_path):
+        fg_config()
+        stub = stub_factory(mode)
+        stopped = self._spy_stop(monkeypatch)
+        marker = tmp_path / "payload"
+        result = make_env().execute(f"touch {marker}", resource_scope=True)
+        assert not marker.exists(), result
+        assert result["returncode"] == 1
+        assert len(stub.calls()) == 1
+        assert stopped == []
+
+    def test_unresolved_creation_never_stops_a_same_name_unit(self, worker_host, fg_config, stub_factory,
+                                                               make_env, monkeypatch, tmp_path):
+        fg_config()
+        stub = stub_factory("no_bus")
+        # A request with no reply: the wrapper stays alive without executing its payload.
+        (stub.bindir / "systemd-run").write_text("#!/usr/bin/env bash\nexec sleep 30\n")
+        stopped = self._spy_stop(monkeypatch)
+        marker = tmp_path / "payload"
+        result = make_env().execute(f"touch {marker}", resource_scope=True, timeout=1)
+        assert result["returncode"] == 124
+        assert not marker.exists()
+        assert stopped == []
+
+    def _spy_stop(self, monkeypatch):
         stopped: list[str] = []
-        real = pr._stop_systemd_unit
-        monkeypatch.setattr(pr, "_stop_systemd_unit",
-                            lambda unit: stopped.append(unit) or (real(unit) if result is None else result))
+        monkeypatch.setattr(pr, "_stop_systemd_unit", lambda unit: stopped.append(unit) or True)
         return stopped
 
-    @pytest.mark.live_system_guard_bypass  # stops its own hermes-worker-fg scope, named at run time
+    @pytest.mark.parametrize("populated", [True, False])
+    def test_timeout_reports_remaining_members_from_the_original_pin(
+        self, populated, worker_host, fg_config, stub, make_env, monkeypatch, tmp_path, caplog,
+    ):
+        fg_config()
+        stopped = self._spy_stop(monkeypatch)
+        marker = tmp_path / "started"
+        controls = tmp_path / "controls"
+        controls.mkdir()
+        events = controls / "cgroup.events"
+        events.write_text(f"populated {int(populated)}\nfrozen 0\n")
+        for name in ("cgroup.freeze", "cgroup.kill"):
+            (controls / name).write_text("")
+
+        def pin_original(proc, unit, invocation_id, anchor_pid):
+            with ExitStack() as files:
+                directory = os.open(controls, os.O_DIRECTORY)
+                files.callback(os.close, directory)
+                fds = []
+                for name, access in (("events", os.O_RDONLY), ("freeze", os.O_WRONLY), ("kill", os.O_WRONLY)):
+                    fd = os.open(f"cgroup.{name}", access, dir_fd=directory)
+                    files.callback(os.close, fd)
+                    fds.append(fd)
+                events.rename(controls / "original.events")
+                events.write_text(f"populated {int(not populated)}\nfrozen 0\n")
+                original_events, freeze, kill = fds
+                return fs._PinnedScope("boot", (proc.pid, 1), (anchor_pid, 1),
+                                       ("bus", ":1.2", f"/app.slice/{unit}", "12" * 16, 1),
+                                       (17, 1), directory, original_events, freeze, kill, files.pop_all())
+
+        monkeypatch.setattr(fs, "_pin_original", pin_original)
+        result = make_env().execute(f"touch '{marker}'; exec sleep 30", resource_scope=True, timeout=2)
+        assert result["returncode"] == 124, result
+        assert marker.is_file(), "timed out before the admitted payload started"
+        assert stopped == []
+        assert (controls / "cgroup.freeze").read_bytes() == (b"0" if populated else b"")
+        assert (controls / "cgroup.kill").read_bytes() == b""
+        reports = [record.getMessage() for record in caplog.records if record.name == fs.__name__]
+        assert any("cleanup incomplete: original scope still populated" in report for report in reports) == populated
+
+    @pytest.mark.parametrize("route, member_owned, control_unavailable", [
+        (route, owned, False)
+        for route in ("timeout", "hard-exit", "yield-stop", "yield-exited")
+        for owned in (True, False)
+    ] + [pytest.param("yield-exited", True, True, id="original-control-unavailable")])
+    def test_cleanup_checks_frozen_recursive_members_before_stopping_original(
+        self, route, member_owned, control_unavailable, worker_host, fg_config, stub, make_env,
+        monkeypatch, tmp_path, caplog,
+    ):
+        fg_config()
+        stopped = self._spy_stop(monkeypatch)
+        marker = tmp_path / "started"
+        original, replacement = tmp_path / "original", tmp_path / "current"
+        (replacement / "child").mkdir(parents=True)
+        for name in ("events", "freeze", "kill", "procs", "child/cgroup.procs"):
+            path = name if name.startswith("child/") else f"cgroup.{name}"
+            (replacement / path).touch()
+        child_pid = 2**30
+        real_pread = os.pread
+        real_pwrite = os.pwrite
+        drained = member_owned and not control_unavailable
+        pin_closed = []
+
+        def pin_original(proc, unit, invocation_id, anchor_pid):
+            scope_path = f"/app.slice/{unit}"
+            (replacement / "cgroup.procs").write_text(f"{anchor_pid}\n")
+            (replacement / "child/cgroup.procs").write_text(f"{child_pid}\n")
+            with ExitStack() as files:
+                directory = os.open(replacement, os.O_DIRECTORY)
+                files.callback(os.close, directory)
+                fds = []
+                for name, access in (("events", os.O_RDONLY), ("freeze", os.O_WRONLY), ("kill", os.O_WRONLY)):
+                    fd = os.open(f"cgroup.{name}", access, dir_fd=directory)
+                    files.callback(os.close, fd)
+                    fds.append(fd)
+                events, freeze, kill = fds
+                files.callback(pin_closed.append, True)
+                replacement.rename(original)
+                replacement.mkdir()
+                for name in ("freeze", "kill"):
+                    (replacement / f"cgroup.{name}").touch()
+
+                def cgroup_events(fd, size, offset):
+                    if fd != events:
+                        return real_pread(fd, size, offset)
+                    frozen = (original / "cgroup.freeze").read_bytes() == b"1"
+                    drained = (original / "cgroup.kill").read_bytes() == b"1"
+                    return f"populated {int(not drained)}\nfrozen {int(frozen)}\n".encode()
+
+                monkeypatch.setattr(os, "pread", cgroup_events)
+                if control_unavailable:
+                    def write_control(fd, data, offset):
+                        if fd == kill:
+                            raise FileNotFoundError("original control unavailable")
+                        return real_pwrite(fd, data, offset)
+
+                    monkeypatch.setattr(os, "pwrite", write_control)
+                frames = {anchor_pid: (1, 11), child_pid: (anchor_pid if member_owned else 1, 12)}
+                monkeypatch.setattr(fs, "_process_parent_birth", frames.__getitem__)
+                monkeypatch.setattr(fs, "_unified_membership", lambda pid: scope_path + ("/child" if pid == child_pid else ""))
+                monkeypatch.setattr(fs, "_fd_mount_id", lambda fd: 17)
+                return fs._PinnedScope("boot", (proc.pid, 10), (anchor_pid, 11),
+                                       ("bus", ":1.2", scope_path, "12" * 16, 1),
+                                       (17, 1), directory, events, freeze, kill, files.pop_all())
+
+        monkeypatch.setattr(fs, "_pin_original", pin_original)
+        env = make_env()
+        command = f"touch '{marker}'; exec sleep 30"
+        if route in ("yield-stop", "yield-exited"):
+            from tools.environments import base
+            from tests.waiting import wait_until
+            from tools.terminal_tool_background import yield_to_background_handler
+
+            monkeypatch.setattr(base, "consume_yield", lambda _: marker.is_file())
+            finish = tmp_path / "finish"
+            if route == "yield-exited":
+                command = f"touch '{marker}'; while [ ! -e '{finish}' ]; do sleep .02; done; exit 7"
+            handler = yield_to_background_handler(
+                command=command, env_type="local", cwd=None, effective_task_id="fg-scope-stop",
+                task_id="fg-scope-stop", session_key="")
+            proc = env._run_bash(command, resource_scope=True)
+            try:
+                yielded = env._wait_for_process(proc, timeout=5, yield_handler=handler)
+                session_id = yielded["yielded_session_id"]
+                if route == "yield-exited":
+                    session = pr.process_registry.get(session_id)
+                    assert session is not None
+                    reader = session._reader_thread
+                    assert reader is not None
+                    finish.touch()
+                    assert wait_until(lambda: not reader.is_alive(), timeout=5)
+                    assert session.exited and session.exit_code == 7
+                    assert (original / "cgroup.kill").read_bytes() == b""
+                    assert not pin_closed, "the populated scope must remain available for explicit stop"
+                expected = "already_exited" if route == "yield-exited" else "killed"
+                result = pr.process_registry.kill_process(session_id)
+                assert (original / "cgroup.kill").read_bytes() == (b"1" if drained else b"")
+                assert result["status"] == (expected if drained else "error"), result
+                if route == "yield-exited":
+                    repeated = pr.process_registry.kill_process(session_id)
+                    assert repeated["status"] == result["status"], repeated
+                    if drained:
+                        assert repeated["exit_code"] == 7
+                        assert pin_closed == [True]
+                    else:
+                        expected_reason = "original scope stop control write failed" if control_unavailable else "provenance unverified"
+                        assert expected_reason in repeated["error"], repeated
+                        assert not pin_closed
+                        monkeypatch.setattr(pr, "FINISHED_TTL_SECONDS", -1)
+                        with pr.process_registry._lock:
+                            pr.process_registry._prune_if_needed()
+                        assert pin_closed == [True]
+            finally:
+                proc.kill()
+                proc.wait(timeout=5)
+                fs.close_admission(proc)
+        elif route == "hard-exit":
+            from tests.waiting import wait_until
+            from tools.environments import base
+
+            # Drive the real hard-exit dispatcher without exiting the test process.
+            monkeypatch.setattr(base, "_exit_fenced", False)
+
+            def force_exit():
+                assert wait_until(marker.is_file, timeout=4), "command was not admitted before hard exit"
+                return base.kill_live_foreground_processes(now=True)
+
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                stopped_live = pool.submit(force_exit)
+                result = env.execute(command, resource_scope=True, timeout=5)
+                assert stopped_live.result(timeout=5) == 1
+            assert result["returncode"] != 0, result
+        else:
+            result = env.execute(command, resource_scope=True, timeout=2)
+            assert result["returncode"] == 124 and marker.is_file(), result
+        assert stopped == []
+        assert (original / "cgroup.kill").read_bytes() == (b"1" if drained else b"")
+        assert (original / "cgroup.freeze").read_bytes() == b"0"
+        assert (replacement / "cgroup.freeze").read_bytes() == b""
+        assert (replacement / "cgroup.kill").read_bytes() == b""
+        reports = [record.getMessage() for record in caplog.records if record.name == fs.__name__]
+        assert any("cleanup incomplete" in report for report in reports) is not drained
+
+    def test_hard_exit_shares_scope_cleanup_budget(self, make_env, monkeypatch, tmp_path):
+        from socket import socketpair
+        from types import SimpleNamespace
+
+        from tools.environments import base
+
+        # Model a kernel that never confirms a freeze. Advance virtual time
+        # only during polling so the aggregate budget is independent of load.
+        elapsed = 0.0
+
+        def advance(seconds):
+            nonlocal elapsed
+            elapsed += seconds
+
+        clock = SimpleNamespace(monotonic=lambda: elapsed, sleep=advance)
+        monkeypatch.setattr(base, "time", clock)
+        monkeypatch.setattr(fs, "time", clock)
+        monkeypatch.setattr(base, "_exit_fenced", False)
+        env = make_env()
+        procs, controls = [], []
+        with ExitStack() as files:
+            for i in range(5):
+                proc = files.enter_context(subprocess.Popen(["sleep", "30"], start_new_session=True))
+                files.callback(proc.kill)
+                procs.append(proc)
+                monkeypatch.setitem(base._live_foreground, id(proc), (env, proc))
+                if i == 4:  # the unscoped command must still be stopped after budget expiry
+                    continue
+                directory = tmp_path / str(i)
+                directory.mkdir()
+                (directory / "events").write_bytes(b"populated 1\nfrozen 0\n")
+                events = files.enter_context((directory / "events").open("rb"))
+                freeze = files.enter_context((directory / "freeze").open("w+b"))
+                stop = files.enter_context((directory / "stop").open("w+b"))
+                controls.append((freeze, stop))
+                parent, child = socketpair()
+                files.enter_context(parent)
+                files.enter_context(child)
+                admission = fs._HeldAdmission(parent)
+                admission._original = fs._PinnedScope(
+                    "boot", (proc.pid, 10), (1, 11), ("bus", ":1.2", "/scope", "12" * 16, 1),
+                    (17, 1), -1, events.fileno(), freeze.fileno(), stop.fileno(), ExitStack())
+                setattr(proc, "_hermes_scope_admission", admission)
+                setattr(proc, "_hermes_scope_unit", f"test-{i}.scope")
+
+            assert base.kill_live_foreground_processes(now=True) == len(procs)
+            assert all(proc.wait(timeout=5) < 0 for proc in procs)
+            assert controls[0][0].read() == b"0"
+            assert all(freeze.read() in (b"", b"0") and stop.read() == b"" for freeze, stop in controls)
+            assert elapsed <= base._HARD_KILL_BUDGET_S, elapsed
+
+    def test_hard_exit_closes_held_channel_while_admission_fence_is_busy(self, make_env, monkeypatch):
+        from concurrent.futures import TimeoutError
+        from socket import socketpair
+
+        from tools.environments import base
+
+        monkeypatch.setattr(base, "_exit_fenced", False)
+        env = make_env()
+        with ExitStack() as files:
+            proc = files.enter_context(subprocess.Popen(["sleep", "30"], start_new_session=True))
+            files.callback(proc.kill)
+            parent, child = socketpair()
+            files.enter_context(parent)
+            files.enter_context(child)
+            admission = fs._HeldAdmission(parent)
+            setattr(proc, "_hermes_scope_admission", admission)
+            setattr(proc, "_hermes_scope_unit", "held.scope")
+            monkeypatch.setitem(base._live_foreground, id(proc), (env, proc))
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                with admission._fence:
+                    stopped = pool.submit(base.kill_live_foreground_processes, now=True)
+                    try:
+                        assert stopped.result(timeout=3) == 1
+                    except TimeoutError:
+                        pytest.fail("hard exit waited for the held admission fence")
+                    child.settimeout(3)
+                    assert child.recv(1) == b"", "hard exit left the payload gate open"
+                    assert proc.wait(timeout=3) < 0
+
+    def test_hard_exit_releases_an_in_progress_scope_freeze(self, make_env, monkeypatch, tmp_path):
+        from socket import socketpair
+
+        from tools.environments import base
+
+        freeze_requested = Event()
+        freeze_path = tmp_path / "freeze"
+        events_path = tmp_path / "events"
+        events_path.write_bytes(b"populated 1\nfrozen 0\n")
+        real_write = fs._write_control
+        monkeypatch.setattr(base, "_exit_fenced", False)
+        env = make_env()
+        with ExitStack() as files:
+            proc = files.enter_context(subprocess.Popen(["sleep", "30"], start_new_session=True))
+            files.callback(proc.kill)
+            parent, child = socketpair()
+            files.enter_context(parent)
+            files.enter_context(child)
+            events = files.enter_context(events_path.open("rb"))
+            freeze = files.enter_context(freeze_path.open("w+b"))
+            stop = files.enter_context((tmp_path / "stop").open("w+b"))
+            admission = fs._HeldAdmission(parent)
+            admission._original = fs._PinnedScope(
+                "boot", (proc.pid, 10), (1, 11), ("bus", ":1.2", "/scope", "12" * 16, 1),
+                (17, 1), -1, events.fileno(), freeze.fileno(), stop.fileno(), ExitStack())
+            setattr(proc, "_hermes_scope_admission", admission)
+            setattr(proc, "_hermes_scope_unit", "held.scope")
+            monkeypatch.setitem(base._live_foreground, id(proc), (env, proc))
+
+            def write_control(fd, value):
+                real_write(fd, value)
+                if fd == freeze.fileno() and value == b"1":
+                    freeze_requested.set()
+
+            monkeypatch.setattr(fs, "_write_control", write_control)
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                cleanup = pool.submit(fs.cleanup_original, proc, timeout=3)
+                assert freeze_requested.wait(5), "ordinary cleanup did not request a freeze"
+                assert base.kill_live_foreground_processes(now=True) == 1
+                # A caller really exits here; thawing later on the cleanup thread is too late.
+                assert freeze_path.read_bytes() == b"0"
+                assert stop.read() == b""
+                assert proc.wait(timeout=3) < 0
+                cleanup.result(timeout=3)
+
     def test_timeout_stops_the_whole_scope(self, worker_host, fg_config, real_systemd_stub, make_env, monkeypatch):
         fg_config()
-        stopped = self._spy_stop(monkeypatch, result=None)
+        stopped = self._spy_stop(monkeypatch)
         result = make_env().execute("sleep 30 & setsid sleep 30 & wait", resource_scope=True, timeout=1)
         assert result["returncode"] == 124, result
         (call,) = real_systemd_stub.calls()
-        assert stopped == [f"{call.unit}.scope"]
+        assert stopped == []
         state = _systemctl("is-active", f"{call.unit}.scope")
         assert state.stdout.strip() == "inactive", state
 
@@ -552,23 +1152,58 @@ class TestScopeLifecycle:
         finally:
             _systemctl("stop", f"{call.unit}.scope")
 
-    def test_yield_to_background_carries_the_scope_unit(self, worker_host, fg_config, stub, make_env, monkeypatch):
+    def test_yield_transfers_original_pin_until_background_exit(
+            self, worker_host, fg_config, stub, make_env, monkeypatch, tmp_path):
+        from threading import Event
+        from tools.environments import base
+        from tools.terminal_tool_background import yield_to_background_handler
+
+        fg_config()
+        closed = Event()
+
+        class Pin(_FixturePin):
+            def close(self):
+                closed.set()
+
+        monkeypatch.setattr(fs, "_pin_original", lambda *_: Pin())
+        started = tmp_path / "started"
+        monkeypatch.setattr(base, "consume_yield", lambda _: started.exists())
+        command = f"touch '{started}'; exec sleep 30"
+        handler = yield_to_background_handler(
+            command=command, env_type="local", cwd=None, effective_task_id="fg-pin-yield",
+            task_id="fg-pin-yield", session_key="")
+        env = make_env()
+        proc = env._run_bash(command, resource_scope=True)
+        try:
+            result = env._wait_for_process(proc, timeout=5, yield_handler=handler)
+            session_id = result["yielded_session_id"]
+            try:
+                assert not closed.is_set(), "the foreground waiter closed the background command's original pin"
+            finally:
+                pr.process_registry.kill_process(session_id)
+            assert closed.wait(5), "the background owner did not close the pin on exit"
+        finally:
+            proc.kill()
+            proc.wait(timeout=5)
+
+    def test_yielded_command_never_stops_a_scope_by_name(self, worker_host, fg_config, stub, make_env, monkeypatch):
         from tools.terminal_tool_background import yield_to_background_handler
         fg_config()
         stopped = self._spy_stop(monkeypatch)
-        proc = make_env()._run_bash("sleep 30", resource_scope=True)
+        command = "echo ready; sleep 30"
+        proc = make_env()._run_bash(command, resource_scope=True)
         try:
+            assert proc.stdout.readline().strip() == "ready"
             handler = yield_to_background_handler(
-                command="sleep 30", env_type="local", cwd=None, effective_task_id="fg-yield",
+                command=command, env_type="local", cwd=None, effective_task_id="fg-yield",
                 task_id="fg-yield", session_key="")
             handed = handler(proc, "")
-            session = pr.process_registry.get(handed["yielded_session_id"])
-            (call,) = stub.calls()
-            assert session.systemd_unit == f"{call.unit}.scope"
-            pr.process_registry.kill_process(session.id)
-            assert stopped == [f"{call.unit}.scope"]
+            pr.process_registry.kill_process(handed["yielded_session_id"])
+            assert len(stub.calls()) == 1
+            assert stopped == []
         finally:
             proc.kill()
+            proc.wait(timeout=5)
 
 
 # --------------------------------------------------------------------------- T4g: Gradle daemon policy
