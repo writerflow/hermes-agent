@@ -17,6 +17,9 @@ import logging
 import os
 import re
 import shutil
+import subprocess
+import sys
+import tempfile
 import uuid
 from dataclasses import dataclass
 from typing import Mapping
@@ -38,9 +41,14 @@ _NO_DAEMON_FLAG = "-Dorg.gradle.daemon=false"
 _UNIT_PREFIX = "hermes-worker-fg-"
 _UNIT_TASK_CHARS = 8
 
-# What the wrapper prints when it fails before the command could start (bus lost after the probe).
-_WRAPPER_FAILURE = re.compile(r"^Failed to (connect to (the )?(user )?bus|create bus connection|"
-                              r"connect to user scope bus):", re.IGNORECASE | re.MULTILINE)
+# systemd-run reports a bus-open failure before entering start_transient_scope().
+# Match only a complete, standalone launcher diagnostic, not lines in a job error.
+_WRAPPER_FAILURE = re.compile(r"Failed to (connect to (the )?(user )?bus|create bus connection|"
+                              r"connect to user scope bus): [^\r\n]+", re.IGNORECASE)
+_MAX_WRAPPER_STDERR = 8192
+# Post-placement exec shim: close launcher stderr before any payload code runs.
+# Use the current interpreter in isolated mode, not a shell that can source startup files.
+_RESTORE_STDERR = "import os, sys; os.dup2(1, 2); os.execvp(sys.argv[1], sys.argv[1:])"
 # The one limit text a probe has confirmed: bash's fork failure under TasksMax (EAGAIN).
 _TASKS_LIMIT_TEXT = "Resource temporarily unavailable"
 LIMIT_NOTE = ("[hermes-worker-fg scope: this command hit the scope's task limit (TasksMax); to turn per-command "
@@ -125,7 +133,7 @@ def scope_command(args: list[str], run_env: Mapping[str, str]) -> ScopedSpawn | 
     unit = _unit_name()
     no_expand = ["--expand-environment=no"] if _registry()._SYSTEMD_RUN_NO_EXPAND else []
     argv = [binary, "--user", "--scope", "--quiet", *no_expand, "--unit", unit, "--collect",
-            "--property", "MemoryAccounting=yes", "--", *args]
+            "--property", "MemoryAccounting=yes", "--", sys.executable, "-I", "-S", "-c", _RESTORE_STDERR, *args]
     env = _gradle_env(_registry().systemd_user_bus_env(dict(run_env)), settings.gradle_mode)
     return ScopedSpawn(argv, env, f"{unit}.scope")
 
@@ -137,9 +145,27 @@ def scope_unit_of(proc: object) -> str:
     return unit if isinstance(unit, str) else ""
 
 
-def scope_never_started(returncode: int | None, output: str, cwd_marker: str) -> bool:
-    """Legacy bus-open fallback; a create call error does not prove the request was never sent."""
-    return returncode == 1 and cwd_marker not in output and _WRAPPER_FAILURE.search(output) is not None
+def spawn_scoped(argv: list[str], **kwargs) -> subprocess.Popen:
+    """Capture only systemd-run's stderr; the exec shim re-merges payload stdout/stderr."""
+    diagnostics = tempfile.TemporaryFile(mode="w+b")
+    kwargs["stderr"] = diagnostics
+    try:
+        proc = subprocess.Popen(argv, **kwargs)
+    except BaseException:
+        diagnostics.close()
+        raise
+    setattr(proc, "_hermes_scope_stderr", diagnostics)
+    return proc
+
+
+def wrapper_diagnostic(proc: subprocess.Popen, returncode: int | None) -> tuple[str, bool]:
+    """Return diagnostics and whether they prove the legacy bus-open failure."""
+    diagnostics = getattr(proc, "_hermes_scope_stderr")
+    raw = os.pread(diagnostics.fileno(), _MAX_WRAPPER_STDERR + 1, 0)
+    text = raw[:_MAX_WRAPPER_STDERR].decode("utf-8", "replace").removesuffix("\n")
+    pre_start = (returncode == 1 and len(raw) <= _MAX_WRAPPER_STDERR
+                 and _WRAPPER_FAILURE.fullmatch(text) is not None)
+    return text, pre_start
 
 
 def limit_note(returncode: int | None, output: str) -> str:

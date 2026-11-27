@@ -1240,7 +1240,8 @@ class LocalEnvironment(BaseEnvironment):
             args, run_env = scoped.argv, scoped.env
         # Not spawn_owned: an awaited command needs no spawn-ledger entry; own_process_groups below hands
         # its group to the owner-death supervisor and _wait_for_process releases it.
-        proc = subprocess.Popen(
+        popen = foreground_scope.spawn_scoped if scoped is not None else subprocess.Popen
+        proc = popen(
             args, text=True, env=run_env, encoding="utf-8", errors="replace",
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             stdin=subprocess.PIPE if stdin_data is not None else subprocess.DEVNULL,
@@ -1280,15 +1281,20 @@ class LocalEnvironment(BaseEnvironment):
             if not foreground_scope.scope_unit_of(proc):
                 return result
             cmd_string, login, timeout, stdin_data, spawn_env = proc._hermes_scope_retry
-            if foreground_scope.scope_never_started(result.get("returncode"), result.get("output", ""), self._cwd_marker):
+            diagnostic, pre_start = foreground_scope.wrapper_diagnostic(proc, result.get("returncode"))
+            if pre_start:
                 foreground_scope.warn_bus_lost(spawn_env)
                 fallback = self._run_bash(cmd_string, login=login, timeout=timeout, stdin_data=stdin_data)
                 if "output" in kwargs:
                     kwargs["output"] = _new_output_collector(fallback, kwargs.get("bounded_capture", False))
                 return self._wait_for_process(fallback, *args, **kwargs)
+            if diagnostic:
+                result["output"] = "\n".join(filter(None, (diagnostic, result.get("output"))))
             result["hermes_fg_scope"] = proc._hermes_scope_unit
             return result
         finally:
+            if foreground_scope.scope_unit_of(proc):
+                proc._hermes_scope_stderr.close()
             if (owned_pgid := getattr(proc, "_hermes_owned_pgid", None)) is not None:
                 proc._hermes_owned_pgid = None
                 release_process_groups([owned_pgid])

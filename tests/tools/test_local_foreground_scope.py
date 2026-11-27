@@ -75,6 +75,8 @@ class SystemdStub:
         "no_bus": 'echo "Failed to connect to bus: No such file or directory" >&2; exit 1',
         "lost_create_reply": 'echo "Failed to start transient scope unit: Connection timed out" >&2; exit 1',
         "unit_exists": 'echo "Failed to start transient scope unit: Unit already exists" >&2; exit 1',
+        "multiline_create_error": ('echo "Failed to start transient scope unit: Connection dropped" >&2; '
+                                   'echo "Failed to connect to bus: No such file or directory" >&2; exit 1'),
         # the command did run, and the wrapper still reports failure
         "ran_then_fail": '"${args[@]:$((sep+1))}"; exit 1',
     }
@@ -521,7 +523,20 @@ class TestPropertySet:
 # --------------------------------------------------------------------------- T4: kill, timeout, yield
 @pytest.mark.platforms("linux")
 class TestScopeLifecycle:
-    @pytest.mark.parametrize("mode", ["lost_create_reply", "unit_exists"])
+    @pytest.mark.parametrize("redirect", ["", " >&2"])
+    def test_payload_bus_diagnostic_does_not_trigger_fallback(self, redirect, worker_host, fg_config,
+                                                             stub, make_env, tmp_path):
+        fg_config()
+        counter = tmp_path / "counter"
+        diagnostic = "Failed to connect to bus: No such file or directory"
+        result = make_env().execute(
+            f"echo ran >> {counter}; echo '{diagnostic}'{redirect}; exit 1", resource_scope=True)
+        assert counter.read_text() == "ran\n"
+        assert result["returncode"] == 1
+        assert result["output"].strip() == diagnostic
+        assert len(stub.calls()) == 1
+
+    @pytest.mark.parametrize("mode", ["lost_create_reply", "unit_exists", "multiline_create_error"])
     def test_create_call_failure_does_not_run_payload_unscoped(self, mode, worker_host, fg_config,
                                                              stub_factory, make_env, monkeypatch, tmp_path):
         fg_config()
