@@ -176,6 +176,36 @@ def test_the_sweep_never_touches_a_process_another_interpreter_recorded(monkeypa
                 proc.wait(timeout=5)
 
 
+@pytest.mark.parametrize("escalated", [False, True])
+def test_force_update_holds_without_the_original_foreground_scope(monkeypatch, tmp_path, no_record, escalated):
+    from tools import process_registry
+
+    gateway_pid = 1001
+    checkpoint = tmp_path / "processes.json"
+    receipt = [{"session_id": "proc_fg", "pid": 1002, "pid_scope": "host", "host_start_time": 123,
+                "systemd_unit": "foreground-fixture.scope", "owner_pid": gateway_pid,
+                "original_scope_required": True}]
+    checkpoint.write_text(json.dumps(receipt))
+    effects = []
+    monkeypatch.setattr(process_registry.ProcessRegistry, "_host_pid_is_ours", lambda *_: True)
+    monkeypatch.setattr(process_registry.ProcessRegistry, "_terminate_host_pid", lambda *_: effects.append("PID"))
+    monkeypatch.setattr(process_registry, "_stop_systemd_unit", lambda *_: effects.append("scope") or False)
+    monkeypatch.setattr(force_stop, "_kill_scope", lambda *_: effects.append("scope escalation"))
+    monkeypatch.setattr(force_stop, "_checkpoint_homes", lambda _: [tmp_path])
+    monkeypatch.setattr(force_stop, "_live_work", lambda _: [])
+    monkeypatch.setattr(force_stop, "_ask_force_stop", lambda _: True)
+    monkeypatch.setattr(force_stop, "_kill", lambda _: None)
+    pid_checks = iter([[gateway_pid], []] if escalated else [[]])
+    monkeypatch.setattr(posix_pause, "_wait_gone", lambda *_: next(pid_checks))
+
+    with pytest.raises(posix_pause.StopUnsettled) as result:
+        force_stop.force_stop_gateways({}, [{"pid": gateway_pid, "home": str(tmp_path), "ct": None}])
+    assert effects == []
+    assert "proc_fg" in str(result.value)
+    assert "original scope handle unavailable" in str(result.value)
+    assert json.loads(checkpoint.read_text()) == receipt
+
+
 def test_a_worker_scope_that_will_not_stop_aborts_the_update(monkeypatch, tmp_path, no_record):
     """The killed gateway's worker scope holds a child ignoring SIGTERM and its stop fails even
     after the scope is SIGKILLed: that is an unsettled stop naming the scope, never a clean sweep."""
