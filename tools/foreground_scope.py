@@ -465,9 +465,12 @@ def wrapper_diagnostic(proc: subprocess.Popen, returncode: int | None) -> tuple[
     return text, pre_start
 
 
+def close_admission(proc: object) -> None:
+    if (admission := getattr(proc, "_hermes_scope_admission", None)) is not None:
+        admission.close()
+
+
 def close_spawn_streams(proc: subprocess.Popen) -> None:
-    admission: _HeldAdmission = getattr(proc, "_hermes_scope_admission")
-    admission.close()
     streams: _LaunchStreams = getattr(proc, "_hermes_scope_streams")
     streams.stderr.close()
     streams.entered.close()

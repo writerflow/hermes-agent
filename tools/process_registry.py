@@ -1261,9 +1261,14 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
         self._take_handoff_group(session, proc)
         if output_so_far:
             session.append_output(output_so_far)
+        scoped = getattr(proc, "_hermes_scope_admission", None) is not None
+        if scoped:
+            setattr(proc, "_hermes_scope_adopted", True)
         try:
             self._track_started(session, self._reader_loop, f"proc-reader-{session.id}")
         except Exception:
+            if scoped:
+                delattr(proc, "_hermes_scope_adopted")
             # The caller resumes its foreground wait: give it back its group, still covered.
             self._return_handoff_group(session, proc, handed_pgid)
             raise
@@ -1324,8 +1329,8 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
                 head_noise = not chunk.strip()
             self._ingest_output(session, chunk)
         _waiter = None
+        proc = session.process
         try:
-            proc = session.process
             if proc is None or proc.stdout is None:
                 return
             stdout = proc.stdout
@@ -1385,9 +1390,18 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
         finally:
             if _waiter is not None:
                 _waiter.close()
-            self._finish_reader(
-                session, decoder, _append_chunk, "Process",
-                session.process.wait, lambda: session.process.returncode)
+            if proc is not None:
+                self._finish_reader(
+                    session, decoder, _append_chunk, "Process",
+                    lambda: self._wait_for_local_reader(proc), lambda: proc.returncode)
+
+    @staticmethod
+    def _wait_for_local_reader(proc: subprocess.Popen) -> None:
+        proc.wait()
+        if getattr(proc, "_hermes_scope_adopted", False):
+            from tools.foreground_scope import close_admission
+
+            close_admission(proc)
 
     def _finish_reader(self, session, decoder, append, label, wait, exit_code) -> None:
         """Reader-thread teardown: flush the decoder (a truncated multibyte tail becomes

@@ -786,6 +786,39 @@ class TestScopeLifecycle:
         finally:
             _systemctl("stop", f"{call.unit}.scope")
 
+    def test_yield_transfers_original_pin_until_background_exit(
+            self, worker_host, fg_config, stub, make_env, monkeypatch, tmp_path):
+        from threading import Event
+        from tools.environments import base
+        from tools.terminal_tool_background import yield_to_background_handler
+
+        fg_config()
+        closed = Event()
+
+        class Pin:
+            close = closed.set
+
+        monkeypatch.setattr(fs, "_pin_original", lambda *_: Pin())
+        started = tmp_path / "started"
+        monkeypatch.setattr(base, "consume_yield", lambda _: started.exists())
+        command = f"touch '{started}'; exec sleep 30"
+        handler = yield_to_background_handler(
+            command=command, env_type="local", cwd=None, effective_task_id="fg-pin-yield",
+            task_id="fg-pin-yield", session_key="")
+        env = make_env()
+        proc = env._run_bash(command, resource_scope=True)
+        try:
+            result = env._wait_for_process(proc, timeout=5, yield_handler=handler)
+            session_id = result["yielded_session_id"]
+            try:
+                assert not closed.is_set(), "the foreground waiter closed the background command's original pin"
+            finally:
+                pr.process_registry.kill_process(session_id)
+            assert closed.wait(5), "the background owner did not close the pin on exit"
+        finally:
+            proc.kill()
+            proc.wait(timeout=5)
+
     def test_yielded_command_never_stops_a_scope_by_name(self, worker_host, fg_config, stub, make_env, monkeypatch):
         from tools.terminal_tool_background import yield_to_background_handler
         fg_config()
