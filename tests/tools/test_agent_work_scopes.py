@@ -167,7 +167,7 @@ def test_escape_checks_policy_before_update_can_switch(monkeypatch, tmp_path, bu
             data = {"type": "o", "data": ["/org/freedesktop/systemd1/unit/fixture"]}
         elif argv[-1] == "InvocationID":
             data = {"type": "ay", "data": next(invocation_reads)}
-        elif argv[-1] == "ControlGroup":
+        elif argv[-2:] == ["org.freedesktop.systemd1.Scope", "ControlGroup"]:
             data = {"type": "s", "data": moved_to[0]}
         elif argv[-1] == "ActiveState":
             data = {"type": "s", "data": "active"}

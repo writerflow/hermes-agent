@@ -334,7 +334,7 @@ def _build_systemd_scope_argv(shell_argv: list[str], unit_suffix: str) -> list[s
     if binary is None:
         # A successful probe is not evidence that the launch helper still exists.
         # In particular, do not return argv that would run inside the gateway.
-        raise RestartSafeScopeUnavailable("systemd-run disappeared after the availability probe")
+        raise RestartSafeScopeUnavailable("restart-safe systemd scope unavailable: systemd-run disappeared after the availability probe")
     return _systemd_scope_argv(binary, f"hermes-worker-{unit_suffix}", *shell_argv)
 
 

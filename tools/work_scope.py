@@ -85,7 +85,7 @@ class ScopeBus:
         if (not isinstance(invocation, list) or len(invocation) != 16 or not any(invocation)
                 or any(type(n) is not int or not 0 <= n <= 255 for n in invocation)):
             raise ScopeVerificationError("systemd scope invocation was unreadable")
-        if self.property("s", path, UNIT, "ControlGroup") != membership:
+        if self.property("s", path, SCOPE, "ControlGroup") != membership:
             raise ScopeVerificationError("systemd scope membership did not match")
         if self.property("s", path, UNIT, "ActiveState") != "active":
             raise ScopeVerificationError("systemd scope was not active")
