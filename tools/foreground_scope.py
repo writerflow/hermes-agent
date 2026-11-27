@@ -222,7 +222,10 @@ class _PinnedScope:
                     return "original scope still populated; freeze unconfirmed"
                 if not _verified_frozen_members(self, deadline) or self._events()[1] != b"1":
                     return "original scope member provenance unverified"
-                _write_control(self.kill, b"1")
+                try:
+                    _write_control(self.kill, b"1")
+                except OSError:
+                    return "original scope stop control write failed"
                 if not self._wait_for_event(0, b"0", deadline):
                     return "original scope still populated after teardown"
             finally:

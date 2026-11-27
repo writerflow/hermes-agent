@@ -859,10 +859,14 @@ class TestScopeLifecycle:
         reports = [record.getMessage() for record in caplog.records if record.name == fs.__name__]
         assert any("cleanup incomplete: original scope still populated" in report for report in reports) == populated
 
-    @pytest.mark.parametrize("member_owned", [True, False])
-    @pytest.mark.parametrize("route", ["timeout", "hard-exit", "yield-stop", "yield-exited"])
+    @pytest.mark.parametrize("route, member_owned, control_unavailable", [
+        (route, owned, False)
+        for route in ("timeout", "hard-exit", "yield-stop", "yield-exited")
+        for owned in (True, False)
+    ] + [pytest.param("yield-exited", True, True, id="original-control-unavailable")])
     def test_cleanup_checks_frozen_recursive_members_before_stopping_original(
-        self, member_owned, route, worker_host, fg_config, stub, make_env, monkeypatch, tmp_path, caplog,
+        self, route, member_owned, control_unavailable, worker_host, fg_config, stub, make_env,
+        monkeypatch, tmp_path, caplog,
     ):
         fg_config()
         stopped = self._spy_stop(monkeypatch)
@@ -874,6 +878,8 @@ class TestScopeLifecycle:
             (replacement / path).touch()
         child_pid = 2**30
         real_pread = os.pread
+        real_pwrite = os.pwrite
+        drained = member_owned and not control_unavailable
         pin_closed = []
 
         def pin_original(proc, unit, invocation_id, anchor_pid):
@@ -903,6 +909,13 @@ class TestScopeLifecycle:
                     return f"populated {int(not drained)}\nfrozen {int(frozen)}\n".encode()
 
                 monkeypatch.setattr(os, "pread", cgroup_events)
+                if control_unavailable:
+                    def write_control(fd, data, offset):
+                        if fd == kill:
+                            raise FileNotFoundError("original control unavailable")
+                        return real_pwrite(fd, data, offset)
+
+                    monkeypatch.setattr(os, "pwrite", write_control)
                 frames = {anchor_pid: (1, 11), child_pid: (anchor_pid if member_owned else 1, 12)}
                 monkeypatch.setattr(fs, "_process_parent_birth", frames.__getitem__)
                 monkeypatch.setattr(fs, "_unified_membership", lambda pid: scope_path + ("/child" if pid == child_pid else ""))
@@ -942,16 +955,17 @@ class TestScopeLifecycle:
                     assert not pin_closed, "the populated scope must remain available for explicit stop"
                 expected = "already_exited" if route == "yield-exited" else "killed"
                 result = pr.process_registry.kill_process(session_id)
-                assert (original / "cgroup.kill").read_bytes() == (b"1" if member_owned else b"")
-                assert result["status"] == (expected if member_owned else "error"), result
+                assert (original / "cgroup.kill").read_bytes() == (b"1" if drained else b"")
+                assert result["status"] == (expected if drained else "error"), result
                 if route == "yield-exited":
                     repeated = pr.process_registry.kill_process(session_id)
                     assert repeated["status"] == result["status"], repeated
-                    if member_owned:
+                    if drained:
                         assert repeated["exit_code"] == 7
                         assert pin_closed == [True]
                     else:
-                        assert "provenance unverified" in repeated["error"], repeated
+                        expected_reason = "original scope stop control write failed" if control_unavailable else "provenance unverified"
+                        assert expected_reason in repeated["error"], repeated
                         assert not pin_closed
                         monkeypatch.setattr(pr, "FINISHED_TTL_SECONDS", -1)
                         with pr.process_registry._lock:
@@ -981,12 +995,12 @@ class TestScopeLifecycle:
             result = env.execute(command, resource_scope=True, timeout=2)
             assert result["returncode"] == 124 and marker.is_file(), result
         assert stopped == []
-        assert (original / "cgroup.kill").read_bytes() == (b"1" if member_owned else b"")
+        assert (original / "cgroup.kill").read_bytes() == (b"1" if drained else b"")
         assert (original / "cgroup.freeze").read_bytes() == b"0"
         assert (replacement / "cgroup.freeze").read_bytes() == b""
         assert (replacement / "cgroup.kill").read_bytes() == b""
         reports = [record.getMessage() for record in caplog.records if record.name == fs.__name__]
-        assert any("cleanup incomplete" in report for report in reports) is not member_owned
+        assert any("cleanup incomplete" in report for report in reports) is not drained
 
     def test_timeout_stops_the_whole_scope(self, worker_host, fg_config, real_systemd_stub, make_env, monkeypatch):
         fg_config()
