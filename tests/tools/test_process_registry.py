@@ -2298,66 +2298,10 @@ class TestSystemdCgroupIsolation:
         assert session.systemd_unit == f"hermes-worker-{session.id}.scope"
 
     @pytest.mark.platforms("linux")
-    def test_pty_spawn_failure_reaps_scope_before_distinct_pipe_fallback(
-        self, registry, monkeypatch, _gateway_identity
+    @pytest.mark.parametrize("error", [RuntimeError, ImportError])
+    def test_scoped_pty_failure_does_not_stop_or_retry(
+        self, registry, monkeypatch, _gateway_identity, error
     ):
-        """A failed PTY scope must not collide with the pipe fallback scope."""
-        from ptyprocess import PtyProcess
-
-        events = []
-        fake_proc = MagicMock()
-        fake_proc.pid = 4321
-        fake_proc.stdout = iter([])
-        fake_proc.stdin = MagicMock()
-        fake_proc.poll.return_value = None
-
-        def fake_popen(argv, **_kwargs):
-            events.append(("pipe", list(argv)))
-            return fake_proc
-
-        def fake_stop(unit_name):
-            events.append(("stop", unit_name))
-            return True
-
-        def fail_pty(*_args, **_kwargs):
-            events.append(("pty", None))
-            raise RuntimeError("PTY wrapper failed after scope creation")
-
-        monkeypatch.setattr("tools.process_registry._find_shell", lambda: "/bin/bash")
-        monkeypatch.setattr(
-            "tools.process_registry._systemd_run_user_scope_available",
-            lambda: True,
-        )
-        monkeypatch.setattr(
-            "gateway.restart.is_gateway_supervisor_process",
-            lambda environ=None: True,
-        )
-        monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/systemd-run")
-
-        with patch.object(PtyProcess, "spawn", side_effect=fail_pty), \
-            patch("subprocess.Popen", side_effect=fake_popen), \
-            patch("tools.process_registry._stop_systemd_unit", side_effect=fake_stop), \
-            patch("threading.Thread", return_value=MagicMock()), \
-            patch.object(registry, "_write_checkpoint"):
-            session = registry.spawn_local("codex", cwd="/tmp", use_pty=True)
-
-        assert [event[0] for event in events] == ["pty", "stop", "pipe"]
-        stopped_unit = events[1][1]
-        fallback_argv = events[2][1]
-        assert stopped_unit == f"hermes-worker-{session.id}.scope"
-        unit_idx = fallback_argv.index("--unit")
-        assert fallback_argv[unit_idx + 1] == (
-            f"hermes-worker-{session.id}-pipe-fallback"
-        )
-        assert session.systemd_unit == (
-            f"hermes-worker-{session.id}-pipe-fallback.scope"
-        )
-
-    @pytest.mark.platforms("linux")
-    def test_pty_spawn_failure_does_not_fallback_when_scope_reap_fails(
-        self, registry, monkeypatch, _gateway_identity
-    ):
-        """Do not launch a duplicate command while the failed PTY scope may live."""
         from ptyprocess import PtyProcess
 
         monkeypatch.setattr("tools.process_registry._find_shell", lambda: "/bin/bash")
@@ -2374,15 +2318,17 @@ class TestSystemdCgroupIsolation:
         with patch.object(
             PtyProcess,
             "spawn",
-            side_effect=RuntimeError("PTY wrapper failed after scope creation"),
-        ), patch("subprocess.Popen") as pipe_spawn, patch(
-            "tools.process_registry._stop_systemd_unit", return_value=False
+            side_effect=error("PTY wrapper did not confirm launch"),
+        ) as pty_spawn, patch("subprocess.Popen", side_effect=AssertionError("unexpected pipe launch")) as pipe_spawn, patch(
+            "tools.process_registry._stop_systemd_unit", return_value=True
         ) as stop_unit:
-            with pytest.raises(RuntimeError, match="could not be reaped"):
+            with pytest.raises(error, match="did not confirm launch"):
                 registry.spawn_local("codex", cwd="/tmp", use_pty=True)
 
-        stop_unit.assert_called_once()
+        assert "--scope" in pty_spawn.call_args.args[0]
+        stop_unit.assert_not_called()
         pipe_spawn.assert_not_called()
+        assert registry.count_running() == 0
 
     def test_worker_memory_limit_honors_local_guard_mb_override(self, monkeypatch):
         import tools.process_registry as pr

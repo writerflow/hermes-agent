@@ -1150,8 +1150,8 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
 
     def _spawn_local_pty(self, session: ProcessSession, safe_command: str, env_vars: dict) -> ProcessSession:
         """PTY spawn for interactive CLI tools (Codex, Claude Code, REPLs).
-        Raises ImportError when no PTY backend is installed and re-raises any spawn
-        failure; ``spawn_local`` falls back to pipe mode in both cases."""
+        Raises ImportError when no PTY backend is installed. A failed scoped
+        launch is not eligible for pipe fallback."""
         if _IS_WINDOWS:
             from winpty import PtyProcess as _PtyProcessCls
         else:
@@ -1186,31 +1186,27 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
         safe_command = _append_dropped_path_entries(_rewrite_bg(command), self._spawn_env(env_vars).get("PATH", "") if restore_login_path else "")
         session = self._new_session(command, task_id, owner_task_id, session_key, _resolve_safe_cwd(cwd or os.getcwd()),
                                     persist_on_release=persist_on_release)
-        pty_scope_attempted = False
+
         # A worker's pipe or PTY dies with the worker (the child's next write is SIGPIPE): write to a log.
         log = worker_output_log(session.id)
         if use_pty and log is None:
             try:
                 return self._spawn_local_pty(session, safe_command, env_vars)
-            except ImportError:
-                session.pty_fallback = "the PTY library (ptyprocess/pywinpty) is not installed"
-                logger.warning("ptyprocess not installed, falling back to pipe mode")
             except Exception as e:
-                session.pty_fallback = f"the PTY spawn failed ({e})"
-                logger.warning("PTY spawn failed (%s), falling back to pipe mode", e)
-                if session.systemd_unit:
-                    pty_scope_attempted = True
-                    if not _stop_systemd_unit(session.systemd_unit):
-                        raise RuntimeError(
-                            "PTY scope could not be reaped; refusing pipe fallback "
-                            "to avoid duplicate command execution"
-                        ) from e
-                    session.systemd_unit = ""
+                # A failed scoped start proves neither that the payload never
+                # ran nor that the requested unit name belongs to us.
+                if session.systemd_unit or isinstance(e, RestartSafeScopeUnavailable):
+                    raise
+                if isinstance(e, ImportError):
+                    session.pty_fallback = "the PTY library (ptyprocess/pywinpty) is not installed"
+                    logger.warning("ptyprocess not installed, falling back to pipe mode")
+                else:
+                    session.pty_fallback = f"the PTY spawn failed ({e})"
+                    logger.warning("PTY spawn failed (%s), falling back to pipe mode", e)
         # Pipe path (non-PTY or PTY fallback).
         _popen_kwargs = {"creationflags": windows_hide_flags()} if _IS_WINDOWS else {}
-        unit_suffix = f"{session.id}-pipe-fallback" if pty_scope_attempted else session.id
         spawn_argv = self._scope_argv(session, record_exit_command(log, safe_command) if log else safe_command,
-                                      unit_suffix, "Local")
+                                      session.id, "Local")
         spawn_env = self._spawn_env(env_vars)
         if session.systemd_unit:
             spawn_env = systemd_user_bus_env(spawn_env)
