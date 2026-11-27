@@ -141,7 +141,7 @@ async def _create(authority, actor, params):
         after = db._write_generation()
         return (existing, after) if consistent and before == after else None
 
-    def qualified_existing(prepared):
+    def qualified_existing(prepared, on_absent=None):
         # Order the decision against both this connection's writes and external
         # SQLite commits. Never block on the Python writer mutex or SQLite lock.
         if prepared is None or not db._lock.acquire(blocking=False):
@@ -165,6 +165,8 @@ async def _create(authority, actor, params):
             from hermes_state_runtime import _epoch
             _epoch(conn, epoch)
             check_current()
+            if not prepared[0] and on_absent is not None:
+                return on_absent()
             return prepared[0]
         finally:
             try:
@@ -177,13 +179,16 @@ async def _create(authority, actor, params):
                 finally:
                     db._lock.release()
 
-    async def existing_identity():
+    async def existing_identity(on_absent=None):
         read_task = track_mutation(authority, asyncio.to_thread(read_existing))
         prepared = await asyncio.shield(read_task)
         check_current()
-        result = qualified_existing(prepared)
+        result = qualified_existing(prepared, on_absent)
         # Original owner path is the safe fallback, not an empty result.
-        return db.get_session(sid) is not None if result is None else result
+        if result is None:
+            existing = db.get_session(sid) is not None
+            return on_absent() if not existing and on_absent is not None else existing
+        return result
 
     if await existing_identity():
         return restore_local_session(authority, sid), request_id
@@ -213,17 +218,23 @@ async def _create(authority, actor, params):
     read_task = track_mutation(authority, asyncio.to_thread(prepare))
     policy, private = await asyncio.shield(read_task)
     check_current()
-    if await existing_identity():
+    def stage_absent():
+        bound = bind_launch_key(authority, sid, policy, None, config_secrets=private)
+        from gateway.session_local_recovery import local_source
+        source = local_source(authority, sid, actor.subject)
+        route = authority.runner.session_store._generate_session_key(source)
+        now = _now()
+        entry = SessionEntry(route, sid, now, now, origin=source, platform=Platform.LOCAL)
+        # The receipt is committed separately by operation('submit').
+        return {'profile_id': authority.profile_id, 'principal_id': actor.subject, 'request_id': request_id,
+                'session_id': sid, 'route': route, 'entry': entry.to_dict(), 'policy': asdict(bound)}
+
+    decision = await existing_identity(stage_absent)
+    if decision is True:
         return restore_local_session(authority, sid), request_id
-    policy = bind_launch_key(authority, sid, policy, None, config_secrets=private)
-    from gateway.session_local_recovery import local_source
-    source = local_source(authority, sid, actor.subject)
-    route = authority.runner.session_store._generate_session_key(source)
-    now = _now()
-    entry = SessionEntry(route, sid, now, now, origin=source, platform=Platform.LOCAL)
-    # The staged creation receipt: ``operation('submit')`` commits it off the owner loop.
-    return {'profile_id': authority.profile_id, 'principal_id': actor.subject, 'request_id': request_id,
-            'session_id': sid, 'route': route, 'entry': entry.to_dict(), 'policy': asdict(policy)}, request_id
+    if not isinstance(decision, dict):
+        raise RuntimeStoreError('runtime_draining')
+    return decision, request_id
 
 
 # What a message typed into a scheduled job's session settles with (see ``execute``); its text is
