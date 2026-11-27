@@ -73,6 +73,8 @@ class SystemdStub:
         "passthrough": 'exec "${args[@]:$((sep+1))}"',
         # the bus is gone: the wrapper fails before the command could start
         "no_bus": 'echo "Failed to connect to bus: No such file or directory" >&2; exit 1',
+        "lost_create_reply": 'echo "Failed to start transient scope unit: Connection timed out" >&2; exit 1',
+        "unit_exists": 'echo "Failed to start transient scope unit: Unit already exists" >&2; exit 1',
         # the command did run, and the wrapper still reports failure
         "ran_then_fail": '"${args[@]:$((sep+1))}"; exit 1',
     }
@@ -519,6 +521,19 @@ class TestPropertySet:
 # --------------------------------------------------------------------------- T4: kill, timeout, yield
 @pytest.mark.platforms("linux")
 class TestScopeLifecycle:
+    @pytest.mark.parametrize("mode", ["lost_create_reply", "unit_exists"])
+    def test_create_call_failure_does_not_run_payload_unscoped(self, mode, worker_host, fg_config,
+                                                             stub_factory, make_env, monkeypatch, tmp_path):
+        fg_config()
+        stub = stub_factory(mode)
+        stopped = self._spy_stop(monkeypatch)
+        marker = tmp_path / "payload"
+        result = make_env().execute(f"touch {marker}", resource_scope=True)
+        assert not marker.exists(), result
+        assert result["returncode"] == 1
+        assert len(stub.calls()) == 1
+        assert stopped == []
+
     def test_unresolved_creation_never_stops_a_same_name_unit(self, worker_host, fg_config, stub_factory,
                                                                make_env, monkeypatch, tmp_path):
         fg_config()

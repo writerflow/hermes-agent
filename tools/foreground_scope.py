@@ -39,8 +39,8 @@ _UNIT_PREFIX = "hermes-worker-fg-"
 _UNIT_TASK_CHARS = 8
 
 # What the wrapper prints when it fails before the command could start (bus lost after the probe).
-_WRAPPER_FAILURE = re.compile(r"Failed to (connect to (the )?(user )?bus|start transient scope|create bus connection|"
-                              r"connect to user scope bus)", re.IGNORECASE)
+_WRAPPER_FAILURE = re.compile(r"^Failed to (connect to (the )?(user )?bus|create bus connection|"
+                              r"connect to user scope bus):", re.IGNORECASE | re.MULTILINE)
 # The one limit text a probe has confirmed: bash's fork failure under TasksMax (EAGAIN).
 _TASKS_LIMIT_TEXT = "Resource temporarily unavailable"
 LIMIT_NOTE = ("[hermes-worker-fg scope: this command hit the scope's task limit (TasksMax); to turn per-command "
@@ -138,9 +138,8 @@ def scope_unit_of(proc: object) -> str:
 
 
 def scope_never_started(returncode: int | None, output: str, cwd_marker: str) -> bool:
-    """The wrapper failed before the command began: non-zero, a wrapper failure text, and no end marker. A
-    command that started always reaches its marker, so it is never re-run."""
-    return bool(returncode) and cwd_marker not in output and _WRAPPER_FAILURE.search(output) is not None
+    """Legacy bus-open fallback; a create call error does not prove the request was never sent."""
+    return returncode == 1 and cwd_marker not in output and _WRAPPER_FAILURE.search(output) is not None
 
 
 def limit_note(returncode: int | None, output: str) -> str:
