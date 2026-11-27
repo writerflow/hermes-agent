@@ -10,6 +10,9 @@ import os
 import shutil
 import subprocess
 import sys
+import uuid
+
+from tools.work_scope import OOM_POLICY, scoped_payload
 
 logger = logging.getLogger(__name__)
 
@@ -113,7 +116,19 @@ def _run_fresh_recovery_process(
         if not systemd_run:
             logger.warning("Cannot isolate fresh gateway recovery from the gateway cgroup")
             return None
-        command = [systemd_run, "--user", "--scope", "--quiet", "--collect", "--", *command]
+        from tools.process_registry import systemd_user_bus_env
+
+        env.pop("DBUS_SESSION_BUS_ADDRESS", None)
+        env = systemd_user_bus_env(env)
+        if "DBUS_SESSION_BUS_ADDRESS" not in env:
+            logger.warning("Cannot verify the user bus for fresh gateway recovery")
+            return None
+        env.pop("INVOCATION_ID", None)
+        name = f"hermes-update-recovery-{uuid.uuid4().hex}.scope"
+        command = [
+            systemd_run, "--user", "--scope", "--quiet", "--collect", "--unit", name,
+            "--property", f"OOMPolicy={OOM_POLICY}", "--", *scoped_payload(name, command),
+        ]
 
     # The child inherits this environ's values but not their provenance: without it, a sibling's restart
     # env keeps every name only a secret source (or a since-removed .env line) supplied (#135792).

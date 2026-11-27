@@ -322,6 +322,7 @@ _UPDATE_PIPELINE = (
     "gateway/restart.py",
     "gateway/host_topology.py",  # update --force: the served homes of a host multiplexer
     "tools/process_registry.py",  # update --force: sweeps a killed gateway's background processes
+    "tools/work_scope.py",  # update escape and recovery verify systemd placement
     "scripts/desktop-update/",  # the hand-off scripts run `hermes update`
 )
 # Selectors are owned by the import graph, not remembered. The update

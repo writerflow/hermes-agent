@@ -2012,9 +2012,19 @@ class TestSystemdCgroupIsolation:
 
         return fake_popen, captured
 
+    @pytest.fixture
+    def verified_launcher(self, monkeypatch):
+        # These tests replace the process itself. The real child handshake is
+        # exercised separately in test_retained_work_scope.py.
+        owner, launcher = MagicMock(), MagicMock()
+        owner.recv.side_effect = [b"P", b"V"]
+        launcher.fileno.return_value = 12
+        monkeypatch.setattr("tools.process_registry.socket.socketpair", lambda: (owner, launcher))
+        monkeypatch.setattr("tools.process_registry.record_background_intent", lambda *args: None)
+
     @pytest.mark.platforms("linux")
     def test_wraps_in_systemd_scope_when_supervisor_and_available(
-        self, registry, monkeypatch, _gateway_identity
+        self, registry, monkeypatch, _gateway_identity, verified_launcher
     ):
         """Under a supervisor with systemd-run available, the spawn argv is
         wrapped in ``systemd-run --user --scope --unit=hermes-worker-<id>``."""
@@ -2039,7 +2049,7 @@ class TestSystemdCgroupIsolation:
         ):
             session = registry.spawn_local("echo hello", cwd="/tmp")
 
-        argv = captured["argv"]
+        argv = captured["argv"][5:]  # after the held starter
         assert argv[0] == "/usr/bin/systemd-run", argv
         assert "--user" in argv
         assert "--scope" in argv
@@ -2055,10 +2065,7 @@ class TestSystemdCgroupIsolation:
             if value == "--property"
         ]
         assert "MemoryAccounting=yes" in properties
-        # systemd rejects OOMPolicy= on transient --scope units across the versions
-        # users run (239/245/249, #102486); emitting it fails the probe and every
-        # cron worker dispatch. MemoryMax + MemoryAccounting carry the isolation.
-        assert not any(p.startswith("OOMPolicy=") for p in properties), properties
+        assert "OOMPolicy=continue" in properties
         memory_max = next(
             value for value in properties if value.startswith("MemoryMax=")
         )
@@ -2232,7 +2239,7 @@ class TestSystemdCgroupIsolation:
 
     @pytest.mark.platforms("linux")
     def test_systemd_post_spawn_failure_never_kills_gateway_process_group(
-        self, registry, monkeypatch, _gateway_identity
+        self, registry, monkeypatch, _gateway_identity, verified_launcher
     ):
         """Cleanup must not killpg: scope teardown is the authoritative path."""
         fake_popen, _captured = self._fake_popen_capture()
@@ -2266,7 +2273,7 @@ class TestSystemdCgroupIsolation:
         killpg.assert_not_called()
 
     @pytest.mark.platforms("linux")
-    def test_pty_spawn_is_wrapped_in_systemd_scope(self, registry, monkeypatch, _gateway_identity):
+    def test_pty_spawn_is_wrapped_in_systemd_scope(self, registry, monkeypatch, _gateway_identity, verified_launcher):
         """Interactive executors receive the same sibling-cgroup isolation."""
         from ptyprocess import PtyProcess
 
@@ -2289,7 +2296,7 @@ class TestSystemdCgroupIsolation:
             patch.object(registry, "_write_checkpoint"):
             session = registry.spawn_local("codex", cwd="/tmp", use_pty=True)
 
-        argv = pty_spawn.call_args.args[0]
+        argv = pty_spawn.call_args.args[0][5:]  # after the held starter
         assert argv[0] == "/usr/bin/systemd-run"
         assert "--scope" in argv
         assert "--unit" in argv
@@ -2298,66 +2305,10 @@ class TestSystemdCgroupIsolation:
         assert session.systemd_unit == f"hermes-worker-{session.id}.scope"
 
     @pytest.mark.platforms("linux")
-    def test_pty_spawn_failure_reaps_scope_before_distinct_pipe_fallback(
-        self, registry, monkeypatch, _gateway_identity
+    @pytest.mark.parametrize("error", [RuntimeError, ImportError])
+    def test_scoped_pty_failure_does_not_stop_or_retry(
+        self, registry, monkeypatch, _gateway_identity, error
     ):
-        """A failed PTY scope must not collide with the pipe fallback scope."""
-        from ptyprocess import PtyProcess
-
-        events = []
-        fake_proc = MagicMock()
-        fake_proc.pid = 4321
-        fake_proc.stdout = iter([])
-        fake_proc.stdin = MagicMock()
-        fake_proc.poll.return_value = None
-
-        def fake_popen(argv, **_kwargs):
-            events.append(("pipe", list(argv)))
-            return fake_proc
-
-        def fake_stop(unit_name):
-            events.append(("stop", unit_name))
-            return True
-
-        def fail_pty(*_args, **_kwargs):
-            events.append(("pty", None))
-            raise RuntimeError("PTY wrapper failed after scope creation")
-
-        monkeypatch.setattr("tools.process_registry._find_shell", lambda: "/bin/bash")
-        monkeypatch.setattr(
-            "tools.process_registry._systemd_run_user_scope_available",
-            lambda: True,
-        )
-        monkeypatch.setattr(
-            "gateway.restart.is_gateway_supervisor_process",
-            lambda environ=None: True,
-        )
-        monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/systemd-run")
-
-        with patch.object(PtyProcess, "spawn", side_effect=fail_pty), \
-            patch("subprocess.Popen", side_effect=fake_popen), \
-            patch("tools.process_registry._stop_systemd_unit", side_effect=fake_stop), \
-            patch("threading.Thread", return_value=MagicMock()), \
-            patch.object(registry, "_write_checkpoint"):
-            session = registry.spawn_local("codex", cwd="/tmp", use_pty=True)
-
-        assert [event[0] for event in events] == ["pty", "stop", "pipe"]
-        stopped_unit = events[1][1]
-        fallback_argv = events[2][1]
-        assert stopped_unit == f"hermes-worker-{session.id}.scope"
-        unit_idx = fallback_argv.index("--unit")
-        assert fallback_argv[unit_idx + 1] == (
-            f"hermes-worker-{session.id}-pipe-fallback"
-        )
-        assert session.systemd_unit == (
-            f"hermes-worker-{session.id}-pipe-fallback.scope"
-        )
-
-    @pytest.mark.platforms("linux")
-    def test_pty_spawn_failure_does_not_fallback_when_scope_reap_fails(
-        self, registry, monkeypatch, _gateway_identity
-    ):
-        """Do not launch a duplicate command while the failed PTY scope may live."""
         from ptyprocess import PtyProcess
 
         monkeypatch.setattr("tools.process_registry._find_shell", lambda: "/bin/bash")
@@ -2374,15 +2325,20 @@ class TestSystemdCgroupIsolation:
         with patch.object(
             PtyProcess,
             "spawn",
-            side_effect=RuntimeError("PTY wrapper failed after scope creation"),
-        ), patch("subprocess.Popen") as pipe_spawn, patch(
-            "tools.process_registry._stop_systemd_unit", return_value=False
+            side_effect=error("PTY wrapper did not confirm launch"),
+        ) as pty_spawn, patch("subprocess.Popen", side_effect=AssertionError("unexpected pipe launch")) as pipe_spawn, patch(
+            "tools.process_registry._stop_systemd_unit", return_value=True
         ) as stop_unit:
-            with pytest.raises(RuntimeError, match="could not be reaped"):
-                registry.spawn_local("codex", cwd="/tmp", use_pty=True)
+            from tools.process_registry import RestartSafeScopeUnavailable
 
-        stop_unit.assert_called_once()
+            with pytest.raises(RestartSafeScopeUnavailable, match="not verified") as exc:
+                registry.spawn_local("codex", cwd="/tmp", use_pty=True)
+            assert isinstance(exc.value.__cause__, error)
+
+        assert "--scope" in pty_spawn.call_args.args[0]
+        stop_unit.assert_not_called()
         pipe_spawn.assert_not_called()
+        assert registry.count_running() == 0
 
     def test_worker_memory_limit_honors_local_guard_mb_override(self, monkeypatch):
         import tools.process_registry as pr
@@ -2470,12 +2426,7 @@ class TestSystemdCgroupIsolation:
         assert first is True
         assert second is True
         assert len(probe_calls) == 1, "probe must run only once (cached)"
-        # The probe must not carry OOMPolicy= either: that is the argv systemd
-        # rejected on scope units and cached as "unavailable" (#102486).
-        probe_argv = probe_calls[0][0]
-        assert not any(
-            value.startswith("OOMPolicy=") for value in probe_argv if isinstance(value, str)
-        ), probe_argv
+        assert "OOMPolicy=continue" in probe_calls[0][0]
 
     @pytest.mark.platforms("linux")
     @pytest.mark.parametrize("rejects_no_expand", [False, True], ids=["systemd>=254", "systemd<254"])
@@ -2528,7 +2479,8 @@ class TestSystemdCgroupIsolation:
 
         assert pr._systemd_run_user_scope_available() is True
         clock[0] += 61
-        assert pr._systemd_run_user_scope_available() is False
+        with pytest.raises(pr.RestartSafeScopeUnavailable, match="OOMPolicy"):
+            pr._systemd_run_user_scope_available()
         assert len(probe_calls) == 2
 
     @pytest.mark.platforms("linux")
@@ -2619,8 +2571,8 @@ class TestSystemdCgroupIsolation:
         assert pr._SYSTEMD_SCOPE_AVAILABLE is False
 
     @pytest.mark.platforms("linux")
-    def test_probe_succeeds_without_bin_true(self, monkeypatch):
-        """An absent ``/bin/true`` must not make a usable scope fail its probe."""
+    def test_probe_payload_without_scope_membership_refuses(self, monkeypatch):
+        """Running the inert payload is not proof that systemd placed it."""
         import tools.process_registry as pr
 
         monkeypatch.setattr(pr, "_SYSTEMD_SCOPE_AVAILABLE", None)
@@ -2628,19 +2580,21 @@ class TestSystemdCgroupIsolation:
         real_run = subprocess.run
         executed = []
 
-        def systemd_run_on_nixos_shaped_root(argv, **kwargs):
-            # Simulate NixOS's missing executable, but run the selected replacement.
+        def systemd_run_without_placement(argv, **kwargs):
             payload = argv[argv.index("--") + 1 :]
-            if payload[0] == "/bin/true":
-                return subprocess.CompletedProcess(payload, 127, stderr=b"No such file or directory")
             executed.append(payload)
-            return real_run(payload, **kwargs)
+            # The PM dependency interpreter need not have checkout modules on
+            # sys.path before Hermes bootstrap. The inert check uses stdlib only.
+            result = real_run([payload[0], "-S", *payload[1:]], **kwargs)
+            assert result.returncode == 1 and not result.stderr, result
+            return result
 
         monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/systemd-run")
-        monkeypatch.setattr("subprocess.run", systemd_run_on_nixos_shaped_root)
+        monkeypatch.setattr("subprocess.run", systemd_run_without_placement)
 
-        assert pr._systemd_run_user_scope_available() is True
-        assert len(executed) == 1, "payload must really run (exit 0) on the host, not just be spelled right"
+        with pytest.raises(pr.RestartSafeScopeUnavailable, match="OOMPolicy"):
+            pr._systemd_run_user_scope_available()
+        assert len(executed) == 1
 
     @pytest.mark.platforms("linux")
     def test_systemd_scope_first_probe_is_serialized(self, monkeypatch):
@@ -2710,8 +2664,9 @@ class TestSystemdCgroupIsolation:
         monkeypatch.setattr("tools.process_registry.time.monotonic", lambda: clock[0])
         monkeypatch.setattr("subprocess.run", fake_run)
 
-        assert pr._systemd_run_user_scope_available() is False
-        assert pr._systemd_run_user_scope_available() is False
+        for _ in range(2):
+            with pytest.raises(pr.RestartSafeScopeUnavailable, match="OOMPolicy"):
+                pr._systemd_run_user_scope_available()
         assert len(probe_calls) == 1
 
         clock[0] += 61

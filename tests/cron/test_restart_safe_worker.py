@@ -6,6 +6,7 @@ import asyncio
 import json
 import os
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -239,7 +240,7 @@ def test_external_worker_refuses_to_run_without_durable_ownership(
     assert not ack.exists()
 
 
-def _stub_external_worker_launch(scheduler, monkeypatch):
+def _stub_external_worker_launch(scheduler, monkeypatch, *, verified_peer=None):
     """Fake Popen that acks the handoff and reports running -> completed.
 
     Returns ``(spawned, payloads, handoff, get)`` for the caller's assertions.
@@ -261,6 +262,10 @@ def _stub_external_worker_launch(scheduler, monkeypatch):
 
     def popen(command, **kwargs):
         spawned.append((command, kwargs))
+        if verified_peer is not None:
+            peer = socket.socket(fileno=os.dup(kwargs["pass_fds"][0]))
+            verified_peer.append(peer)
+            peer.sendall(b"V")
         payload_index = command.index("--external-worker-file") + 1
         payloads.append(json.loads(Path(command[payload_index]).read_text()))
         ack_index = command.index("--ack-file") + 1
@@ -298,7 +303,9 @@ def test_scoped_wrapper_exit_without_user_bus_names_the_cause_and_invalidates_pr
     monkeypatch.setattr(scheduler, "_get_hermes_home", lambda: tmp_path)
     monkeypatch.setattr(
         "tools.process_registry.restart_safe_gateway_child_argv",
-        lambda command, **_: GatewayChildDispatch("scoped", ["systemd-run", "--", *command]),
+        lambda command, **_: GatewayChildDispatch(
+            "scoped", ["systemd-run", "--unit", "hermes-worker-cron-test", "--", *command]
+        ),
     )
     monkeypatch.setattr(scheduler, "mark_execution_handoff_pending",
                         lambda _eid: {"id": "exec-1", "handoff_pending": 1})
@@ -318,6 +325,35 @@ def test_scoped_wrapper_exit_without_user_bus_names_the_cause_and_invalidates_pr
     with pytest.raises(RuntimeError, match="user D-Bus session .* disappeared"):
         scheduler._launch_external_cron_worker(job)
     assert pr._SYSTEMD_SCOPE_AVAILABLE is False
+
+
+@pytest.mark.platforms("linux")
+def test_cron_scope_refusal_does_not_release_or_retry_worker(tmp_path, monkeypatch):
+    from cron import scheduler
+    from tools import process_registry as pr
+
+    job = {"id": "job-held", "execution_id": "exec-1", "prompt": "work"}
+    monkeypatch.setattr(scheduler, "_get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(scheduler, "mark_execution_handoff_pending", lambda _: {"id": "exec-1"})
+    monkeypatch.setenv("INVOCATION_ID", "gateway-test")
+    monkeypatch.setattr(pr, "_is_supervised_gateway_process", lambda: True)
+    monkeypatch.setattr(pr, "_systemd_run_user_scope_available", lambda: True)
+    monkeypatch.setattr(pr, "scoped_spawn_lost_user_bus", lambda _: False)
+    monkeypatch.setattr("shutil.which", lambda _: "systemd-run")
+    attempts = []
+
+    def popen(argv, **kwargs):
+        attempts.append((argv, kwargs))
+        return subprocess.CompletedProcess(argv, 1) if kwargs.get("pass_fds") else Mock(poll=lambda: 1)
+
+    monkeypatch.setattr(scheduler.subprocess, "Popen", popen)
+    with pytest.raises(pr.RestartSafeScopeUnavailable, match="placement"):
+        scheduler._launch_external_cron_worker(job)
+    [(argv, options)] = attempts
+    assert "OOMPolicy=continue" in argv
+    assert "--control-fd" in argv
+    assert "INVOCATION_ID" not in options["env"]
+    assert not (tmp_path / "cron/external-workers/exec-1.ready").exists()
 
 
 def test_launch_external_worker_treats_a_routed_fire_as_multiplexed(tmp_path, monkeypatch):
@@ -344,7 +380,7 @@ def test_launch_external_worker_treats_a_routed_fire_as_multiplexed(tmp_path, mo
     monkeypatch.setattr(
         "tools.process_registry.restart_safe_gateway_child_argv",
         lambda command, *, unit_suffix, require_restart_safe_scope=False: GatewayChildDispatch(
-            "scoped", ["scope", "--", *command]),
+            "degraded", command),
     )
     spawned, payloads, _handoff, _get = _stub_external_worker_launch(scheduler, monkeypatch)
 
@@ -362,6 +398,7 @@ def test_launch_external_worker_treats_a_routed_fire_as_multiplexed(tmp_path, mo
     assert os.environ["LAUNCH_ONLY_SECRET"] == "launch-secret"  # parent untouched
 
 
+@pytest.mark.platforms("linux")
 def test_launch_external_worker_uses_restart_safe_scope_and_acknowledges(
     tmp_path, monkeypatch
 ):
@@ -379,13 +416,14 @@ def test_launch_external_worker_uses_restart_safe_scope_and_acknowledges(
 
     def wrap(command, *, unit_suffix, require_restart_safe_scope=False):
         wrapped_commands.append((command, unit_suffix))
-        return GatewayChildDispatch("scoped", ["scope", "--", *command])
+        return GatewayChildDispatch("scoped", ["scope", "--unit", f"hermes-worker-{unit_suffix}", "--", *command])
 
     monkeypatch.setattr(
         "tools.process_registry.restart_safe_gateway_child_argv", wrap
     )
 
-    spawned, payloads, handoff, get = _stub_external_worker_launch(scheduler, monkeypatch)
+    peers = []
+    spawned, payloads, handoff, get = _stub_external_worker_launch(scheduler, monkeypatch, verified_peer=peers)
     monkeypatch.setenv("ANTHROPIC_API_KEY", "should-not-cross-profile")
     monkeypatch.setenv("SERVICE_TOKEN", "default-profile-token")
     from agent.secret_scope import set_multiplex_active
@@ -393,11 +431,17 @@ def test_launch_external_worker_uses_restart_safe_scope_and_acknowledges(
     set_multiplex_active(True)
     try:
         assert scheduler._launch_external_cron_worker(job) is True
+        [peer] = peers
+        peer.settimeout(2)
+        assert peer.recv(1) == b"R"
     finally:
+        for peer in peers:
+            peer.close()
         clear_env_passthrough()
         set_multiplex_active(False)
     assert wrapped_commands[0][1] == "cron-job-1-exec-exec-1"
-    assert spawned[0][0][0:2] == ["scope", "--"]
+    assert spawned[0][0][:3] == ["scope", "--unit", "hermes-worker-cron-job-1-exec-exec-1"]
+    assert "OOMPolicy=continue" in spawned[0][0]
     assert spawned[0][1]["start_new_session"] is True
     assert "ANTHROPIC_API_KEY" not in spawned[0][1]["env"]
     assert spawned[0][1]["env"]["SERVICE_TOKEN"] == "target-profile-token"
@@ -420,7 +464,7 @@ def test_launch_external_worker_honors_ack_within_adoption_grace(
     monkeypatch.setattr(scheduler, "_get_hermes_home", lambda: tmp_path)
     monkeypatch.setattr(
         "tools.process_registry.restart_safe_gateway_child_argv",
-        lambda command, **_kw: GatewayChildDispatch("scoped", ["scope", "--", *command]),
+        lambda command, **_kw: GatewayChildDispatch("degraded", command),
     )
     monkeypatch.setattr(
         scheduler,

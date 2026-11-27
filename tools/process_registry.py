@@ -6,12 +6,14 @@ Nothing runs on the host unless TERMINAL_ENV=local; other backends run in their 
 
 import codecs
 from contextlib import suppress
+from functools import partial
 import json
 import logging
 import os
 import platform
 import shlex
 import signal
+import socket
 import stat
 import subprocess
 import tempfile
@@ -45,6 +47,8 @@ from tools.process_registry_results import load_completed_results, save_complete
 from tools.process_registry_env_log import fallback_exit_code, log_delta_command, parse_log_delta_reply
 from tools.process_registry_wsl import _is_wsl_launcher_command
 from tools.process_registry_wait import max_wait_timeout, process_deadline_floor
+from tools.work_scope import OOM_POLICY, ScopeProbeFailure, before_scope_payload, held_scope_payload, probe_payload
+from tools.work_scope_placement import record_background_intent
 
 logger = logging.getLogger(__name__)
 
@@ -98,21 +102,14 @@ WATCH_GLOBAL_COOLDOWN_SECONDS = 30
 
 
 # --- systemd cgroup isolation for gateway-spawned local executors ------------------
-# Under a systemd gateway with MemoryMax, local background commands inherit the gateway's
-# cgroup, so a memory-heavy executor can get the ENTIRE gateway killed by systemd-oomd;
-# ``systemd-run --user --scope`` gives the worker its own transient cgroup. Usability is
-# probed and cached for a bounded TTL (binary present but user D-Bus absent in system services/containers).
-# A memory-heavy executor (Codex, tests, Node) can push the whole cgroup past MemoryMax and trigger
-# systemd-oomd to kill the ENTIRE gateway — taking down the messaging control plane and silently losing the
-# active turn. We probe whether ``systemd-run --user --scope`` is actually usable (the binary can
-# exist on the PATH while the user D-Bus session is unavailable — common for system services and
-# containers), and cache the verdict for a bounded TTL. See #70716.
-_SYSTEMD_SCOPE_AVAILABLE: Optional[bool] = None
+# A memory-heavy child can push its gateway cgroup past the cap. The inert
+# transient-scope probe verifies that isolation is usable, not just installed.
+_SYSTEMD_SCOPE_AVAILABLE: bool | ScopeProbeFailure | None = None
 _SYSTEMD_SCOPE_PROBE_LOCK = threading.Lock()
 _SYSTEMD_SCOPE_PROBED_AT = 0.0
 # Both verdicts expire: the user bus can vanish after a True (session logout without linger,
 # #110803) and reappear after a False (linger enabled later, #104893).
-_SYSTEMD_SCOPE_PROBE_TTL_SECONDS = 60.0
+_SYSTEMD_SCOPE_PROBE_TTL_SECONDS = 5.0
 # systemd >= 254 expands ``$$``/``${X}`` in a ``--scope`` command line itself unless told not to;
 # older systemd-run rejects the option (and never expanded there), so the probe drops it on rejection.
 _SYSTEMD_RUN_NO_EXPAND = True
@@ -246,11 +243,12 @@ def systemd_user_bus_env(base_env: Optional[dict[str, str]] = None) -> dict[str,
 
 
 def _systemd_scope_cached() -> Optional[bool]:
-    """Cached probe verdict, or None when a (re)probe is due."""
-    if _SYSTEMD_SCOPE_AVAILABLE is None:
+    verdict = _SYSTEMD_SCOPE_AVAILABLE
+    if time.monotonic() - _SYSTEMD_SCOPE_PROBED_AT >= _SYSTEMD_SCOPE_PROBE_TTL_SECONDS:
         return None
-    stale = time.monotonic() - _SYSTEMD_SCOPE_PROBED_AT >= _SYSTEMD_SCOPE_PROBE_TTL_SECONDS
-    return None if stale else _SYSTEMD_SCOPE_AVAILABLE
+    if isinstance(verdict, ScopeProbeFailure):
+        raise RestartSafeScopeUnavailable(verdict.value)
+    return verdict
 
 
 def _systemd_run_user_scope_available() -> bool:
@@ -259,8 +257,7 @@ def _systemd_run_user_scope_available() -> bool:
     the user D-Bus bus even with the binary on PATH (every spawn would fail with
     ``Failed to connect to user bus``), so a cheap probe is run and cached.
 
-    Use ``/bin/sh -c 'exit 0'``: NixOS provides ``/bin/sh`` but not ``/bin/true``
-    (#105365), regardless of the gateway service's PATH."""
+    A rejected or unverified probe is a refusal, not permission to degrade."""
     global _SYSTEMD_SCOPE_AVAILABLE, _SYSTEMD_SCOPE_PROBED_AT, _SYSTEMD_RUN_NO_EXPAND
     verdict = _systemd_scope_cached()
     if verdict is not None:
@@ -271,7 +268,7 @@ def _systemd_run_user_scope_available() -> bool:
         verdict = _systemd_scope_cached()
         if verdict is not None:
             return verdict
-        available = False
+        available: bool | ScopeProbeFailure = False
         if _IS_LINUX:
             try:
                 import shutil
@@ -280,9 +277,12 @@ def _systemd_run_user_scope_available() -> bool:
                 if binary:
                     # Unique unit avoids collisions; the timeout bounds D-Bus.
                     probe_unit = f"hermes-probe-scope-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+                    payload = probe_payload(probe_unit + ".scope")
                     for _attempt in range(2):
+                        call = _systemd_scope_argv(binary, probe_unit, *payload)
+                        call[1:1] = ["--property", f"OOMPolicy={OOM_POLICY}"]
                         result = subprocess.run(
-                            _systemd_scope_argv(binary, probe_unit, "/bin/sh", "-c", "exit 0"),
+                            call,
                             stdin=subprocess.DEVNULL, capture_output=True,
                             timeout=3,
                             env=systemd_user_bus_env(),
@@ -290,19 +290,17 @@ def _systemd_run_user_scope_available() -> bool:
                         )
                         if not (result.returncode and _SYSTEMD_RUN_NO_EXPAND
                                 and b"expand-environment" in (result.stderr or b"")):
+                            available = True if result.returncode == 0 else ScopeProbeFailure.UNVERIFIED_POLICY
                             break
                         # systemd < 254 rejects the option: drop it and probe again.
                         _SYSTEMD_RUN_NO_EXPAND = False
-                    available = result.returncode == 0
-                    if not available:
-                        logger.debug(
-                            "systemd-run --user --scope probe failed (rc=%s): %s",
-                            result.returncode, (result.stderr or b"").decode("utf-8", "replace").strip(),
-                        )
-            except Exception as exc:
+            except (OSError, subprocess.SubprocessError) as exc:
                 logger.debug("systemd-run --user --scope probe error: %s", exc)
+                available = ScopeProbeFailure.UNVERIFIED_POLICY
         _SYSTEMD_SCOPE_AVAILABLE = available
         _SYSTEMD_SCOPE_PROBED_AT = time.monotonic()
+        if isinstance(available, ScopeProbeFailure):
+            raise RestartSafeScopeUnavailable(available.value)
         return available
 
 
@@ -337,8 +335,9 @@ def _build_systemd_scope_argv(shell_argv: list[str], unit_suffix: str) -> list[s
 
     binary = shutil.which("systemd-run")
     if binary is None:
-        # Caller should have probed availability; never pass None into Popen anyway.
-        return shell_argv
+        # A successful probe is not evidence that the launch helper still exists.
+        # In particular, do not return argv that would run inside the gateway.
+        raise RestartSafeScopeUnavailable("restart-safe systemd scope unavailable: systemd-run disappeared after the availability probe")
     return _systemd_scope_argv(binary, f"hermes-worker-{unit_suffix}", *shell_argv)
 
 
@@ -391,6 +390,32 @@ class GatewayChildDispatch(NamedTuple):
     mode: Literal["in_process", "scoped", "degraded"]
     argv: list[str]
 
+    def spawn(self, popen, *, env: dict[str, str], **kwargs):
+        if self.mode != "scoped":
+            return popen(self.argv, env=env, **kwargs)
+
+        try:
+            separator = self.argv.index("--")
+            unit = self.argv[self.argv.index("--unit") + 1] + ".scope"
+            scoped_env = dict(env)
+            scoped_env.pop("INVOCATION_ID", None)
+            owner, launcher = socket.socketpair()
+            with owner, launcher:
+                argv = [
+                    *self.argv[:separator], "--property", f"OOMPolicy={OOM_POLICY}", "--",
+                    *held_scope_payload(unit, launcher.fileno(), self.argv[separator + 1:]),
+                ]
+                owner.settimeout(3)
+                proc = popen(argv, env=scoped_env, pass_fds=(launcher.fileno(),), **kwargs)
+                launcher.close()
+                if owner.recv(1) != b"V":
+                    raise OSError("launcher did not confirm placement")
+                owner.sendall(b"R")
+                return proc
+        except (ValueError, IndexError, OSError) as exc:
+            # Do not stop a unit by name or launch another worker after an uncertain move.
+            raise RestartSafeScopeUnavailable("restart-safe systemd scope placement was not verified") from exc
+
 
 def scoped_spawn_lost_user_bus(spawn_env: dict[str, str]) -> bool:
     """After a ``systemd-run --user --scope`` wrapper exits before its child could start: True
@@ -408,8 +433,9 @@ def scoped_spawn_lost_user_bus(spawn_env: dict[str, str]) -> bool:
     if "DBUS_SESSION_BUS_ADDRESS" in systemd_user_bus_env(base_env):
         return False
     with _SYSTEMD_SCOPE_PROBE_LOCK:
-        _SYSTEMD_SCOPE_AVAILABLE = False
-        _SYSTEMD_SCOPE_PROBED_AT = time.monotonic()
+        if not isinstance(_SYSTEMD_SCOPE_AVAILABLE, ScopeProbeFailure):
+            _SYSTEMD_SCOPE_AVAILABLE = False
+            _SYSTEMD_SCOPE_PROBED_AT = time.monotonic()
     return True
 
 
@@ -463,10 +489,7 @@ def restart_safe_gateway_child_argv(
             f"/run/user/{os.getuid()}/bus). On a system-level service install, run "  # windows-footgun: ok — behind the _IS_LINUX return above
             "`sudo loginctl enable-linger <gateway-user>` and restart the gateway."
         )
-    scoped = _build_systemd_scope_argv(command, unit_suffix=unit_suffix)
-    if scoped == command:
-        return _degrade("systemd-run disappeared after the availability probe")
-    return GatewayChildDispatch("scoped", scoped)
+    return GatewayChildDispatch("scoped", _build_systemd_scope_argv(command, unit_suffix=unit_suffix))
 
 
 def _stop_systemd_unit(unit_name: str) -> bool:
@@ -1110,24 +1133,49 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
                 logger.debug("Could not resolve environment temp dir: %s", exc)
         return tempfile.gettempdir()
 
-    def _scope_argv(self, session: ProcessSession, safe_command: str, unit_suffix: str, label: str) -> list[str]:
-        """Login-shell argv for *safe_command* (parity with LocalEnvironment: rc files
-        sourced, user tools on PATH), wrapped in a transient systemd scope when we are
-        the supervised gateway (own cgroup: an OOM kills only the worker, not the
-        gateway and its messaging control plane)."""
+    def _spawn_local_command(self, session, safe_command, label, spawn, env, **kwargs):
+        """Start the login shell, holding a scoped shell behind a private gate."""
         argv = [_find_shell(), "-lic", f"set +m; {safe_command}"]
-        # This applies to both pipe mode and the PTY path above. See #70716.
         in_supervised_gateway = _IS_LINUX and _is_supervised_gateway_process()
         if in_supervised_gateway and _systemd_run_user_scope_available():
-            session.systemd_unit = f"hermes-worker-{unit_suffix}.scope"
-            return _build_systemd_scope_argv(argv, unit_suffix=unit_suffix)
+            return self._spawn_verified_scope(session, argv, spawn, env, kwargs)
         if in_supervised_gateway:
             # Under a supervisor but no private cgroup: a worker OOM can still take
             # the whole gateway down.
             logger.debug(
                 "%s background executor not isolated in a systemd scope "
                 "(systemd-run --user unavailable); worker shares the gateway cgroup.", label)
-        return argv
+        return spawn(argv, env=env, **kwargs)
+
+    @staticmethod
+    def _spawn_verified_scope(session, argv, spawn, env, kwargs):
+        name = f"hermes-worker-{session.id}.scope"
+        env = systemd_user_bus_env(env)
+        env.pop("INVOCATION_ID", None)
+        try:
+            owner, launcher = socket.socketpair()
+            with owner, launcher:
+                scoped = _build_systemd_scope_argv(
+                    held_scope_payload(name, launcher.fileno(), argv), unit_suffix=session.id,
+                )
+                scoped[1:1] = ["--property", f"OOMPolicy={OOM_POLICY}"]
+                owner.settimeout(3)
+                pending = before_scope_payload(launcher.fileno(), scoped)
+                proc = spawn(pending, env=env, pass_fds=(launcher.fileno(),), **kwargs)
+                launcher.close()
+                if owner.recv(1) != b"P":
+                    raise OSError("launcher did not reach the request gate")
+                record_background_intent(proc.pid, name, session.id)
+                owner.sendall(b"S")
+                if owner.recv(1) != b"V":
+                    raise OSError("launcher did not confirm placement")
+                owner.sendall(b"R")
+        except Exception as exc:
+            # Closing the gate cannot undo an uncertain move. Do not publish a
+            # unit name to the registry or authorize a second launch.
+            raise RestartSafeScopeUnavailable("background scope placement was not verified") from exc
+        session.systemd_unit = name
+        return proc
 
     @staticmethod
     def _spawn_env(env_vars: dict) -> dict:
@@ -1155,21 +1203,27 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
 
     def _spawn_local_pty(self, session: ProcessSession, safe_command: str, env_vars: dict) -> ProcessSession:
         """PTY spawn for interactive CLI tools (Codex, Claude Code, REPLs).
-        Raises ImportError when no PTY backend is installed and re-raises any spawn
-        failure; ``spawn_local`` falls back to pipe mode in both cases."""
+        Raises ImportError when no PTY backend is installed. A failed scoped
+        launch is not eligible for pipe fallback."""
         if _IS_WINDOWS:
             from winpty import PtyProcess as _PtyProcessCls
         else:
             from ptyprocess import PtyProcess as _PtyProcessCls
-        pty_argv = self._scope_argv(session, safe_command, session.id, "PTY")
+        def spawn_pty(argv, *, pass_fds=(), **kwargs):
+            if pass_fds:
+                # ptyprocess preserves the fd at fork but unlike Popen it
+                # does not clear CLOEXEC. Do that only in the child.
+                kwargs.update(pass_fds=pass_fds, preexec_fn=partial(os.set_inheritable, pass_fds[0], True))
+            return _PtyProcessCls.spawn(argv, **kwargs)
+
         pty_env = self._spawn_env(env_vars)
-        if session.systemd_unit:
-            pty_env = systemd_user_bus_env(pty_env)
         # A PTY is a real TTY, so pager-happy tools (git log/diff, man) WILL page and
         # hang waiting for `q` — default them to cat, honoring any pager the user set.
         pty_env.setdefault("GIT_PAGER", "cat")
         pty_env.setdefault("PAGER", "cat")
-        pty_proc = _PtyProcessCls.spawn(pty_argv, cwd=session.cwd, env=pty_env, dimensions=(30, 120))
+        pty_proc = self._spawn_local_command(
+            session, safe_command, "PTY", spawn_pty, pty_env, cwd=session.cwd, dimensions=(30, 120),
+        )
         self._own_pty_job(session, pty_proc)
         session.pid = pty_proc.pid
         session.host_start_time = self._safe_host_start_time(session.pid)
@@ -1191,34 +1245,26 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
         safe_command = _append_dropped_path_entries(_rewrite_bg(command), self._spawn_env(env_vars).get("PATH", "") if restore_login_path else "")
         session = self._new_session(command, task_id, owner_task_id, session_key, _resolve_safe_cwd(cwd or os.getcwd()),
                                     persist_on_release=persist_on_release)
-        pty_scope_attempted = False
+
         # A worker's pipe or PTY dies with the worker (the child's next write is SIGPIPE): write to a log.
         log = worker_output_log(session.id)
         if use_pty and log is None:
             try:
                 return self._spawn_local_pty(session, safe_command, env_vars)
-            except ImportError:
-                session.pty_fallback = "the PTY library (ptyprocess/pywinpty) is not installed"
-                logger.warning("ptyprocess not installed, falling back to pipe mode")
             except Exception as e:
-                session.pty_fallback = f"the PTY spawn failed ({e})"
-                logger.warning("PTY spawn failed (%s), falling back to pipe mode", e)
-                if session.systemd_unit:
-                    pty_scope_attempted = True
-                    if not _stop_systemd_unit(session.systemd_unit):
-                        raise RuntimeError(
-                            "PTY scope could not be reaped; refusing pipe fallback "
-                            "to avoid duplicate command execution"
-                        ) from e
-                    session.systemd_unit = ""
+                # A failed scoped start proves neither that the payload never
+                # ran nor that the requested unit name belongs to us.
+                if session.systemd_unit or isinstance(e, RestartSafeScopeUnavailable):
+                    raise
+                if isinstance(e, ImportError):
+                    session.pty_fallback = "the PTY library (ptyprocess/pywinpty) is not installed"
+                    logger.warning("ptyprocess not installed, falling back to pipe mode")
+                else:
+                    session.pty_fallback = f"the PTY spawn failed ({e})"
+                    logger.warning("PTY spawn failed (%s), falling back to pipe mode", e)
         # Pipe path (non-PTY or PTY fallback).
         _popen_kwargs = {"creationflags": windows_hide_flags()} if _IS_WINDOWS else {}
-        unit_suffix = f"{session.id}-pipe-fallback" if pty_scope_attempted else session.id
-        spawn_argv = self._scope_argv(session, record_exit_command(log, safe_command) if log else safe_command,
-                                      unit_suffix, "Local")
         spawn_env = self._spawn_env(env_vars)
-        if session.systemd_unit:
-            spawn_env = systemd_user_bus_env(spawn_env)
         # start_new_session is REQUIRED with systemd-run --scope too: the scope does not
         # give the worker a new session, so from an interactive TUI the worker would
         # share the foreground process group and background spawns would stop the whole
@@ -1226,8 +1272,10 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
         # the scope attaches to the invoked process, not the spawning session.
         output = open_output_log(log) if log else subprocess.PIPE
         try:
-            proc = self._spawn_job(
-                session, spawn_argv, persist_on_release, text=True, cwd=session.cwd, env=spawn_env,
+            proc = self._spawn_local_command(
+                session, record_exit_command(log, safe_command) if log else safe_command, "Local",
+                lambda argv, **kw: self._spawn_job(session, argv, persist_on_release, **kw),
+                spawn_env, text=True, cwd=session.cwd,
                 encoding="utf-8", errors="replace", stdout=output, stderr=subprocess.STDOUT,
                 stdin=subprocess.DEVNULL, **_popen_kwargs)
         finally:

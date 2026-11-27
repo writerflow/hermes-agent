@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import os
+import socket
 import subprocess
 import sys
 import time
@@ -50,13 +52,18 @@ def worker_setup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path,
 
 
 @pytest.mark.platforms("linux")
+@pytest.mark.parametrize("verified", [False, True], ids=["refused", "verified"])
 def test_managed_gateway_worker_is_spawned_in_restart_safe_scope(
-    worker_setup: tuple[Path, kb.Task], monkeypatch: pytest.MonkeyPatch
+    worker_setup: tuple[Path, kb.Task], monkeypatch: pytest.MonkeyPatch, verified: bool,
 ) -> None:
+    from tools.process_registry import RestartSafeScopeUnavailable
+
     workspace, task = worker_setup
     captured_cmd: list[str] = []
     captured_env: dict[str, str] = {}
     captured_cwd: str | None = None
+    children = []
+    attempts = []
 
     class FakeProc:
         pid = 4242
@@ -66,6 +73,12 @@ def test_managed_gateway_worker_is_spawned_in_restart_safe_scope(
         captured_cmd.extend(cmd)
         captured_env.update(kwargs.get("env") or {})
         captured_cwd = kwargs.get("cwd")
+        attempts.append(list(cmd))
+        fds = kwargs.get("pass_fds", ())
+        if fds and verified:
+            peer = socket.socket(fileno=os.dup(fds[0]))
+            children.append(peer)
+            peer.sendall(b"V")
         return FakeProc()
 
     monkeypatch.setenv("INVOCATION_ID", "managed-gateway-test")
@@ -77,13 +90,28 @@ def test_managed_gateway_worker_is_spawned_in_restart_safe_scope(
     monkeypatch.setattr("tools.process_registry._worker_memory_max_bytes", lambda: 536_870_912)
     monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/systemd-run")
 
-    assert kbd._default_spawn(task, str(workspace)) == 4242
+    try:
+        if verified:
+            assert kbd._default_spawn(task, str(workspace)) == 4242
+            assert children, "worker was not held before placement verification"
+            children[0].settimeout(2)
+            assert children[0].recv(1) == b"R"
+        else:
+            with pytest.raises(RestartSafeScopeUnavailable, match="placement"):
+                kbd._default_spawn(task, str(workspace))
+    finally:
+        for peer in children:
+            peer.close()
+    assert len(attempts) == 1
     assert captured_cmd[:4] == ["/usr/bin/systemd-run", "--user", "--scope", "--quiet"]
     unit_index = captured_cmd.index("--unit")
     assert captured_cmd[unit_index + 1] == "hermes-worker-kanban-t_candidate_restart-run-23"
     assert "MemoryMax=536870912" in captured_cmd
+    assert "OOMPolicy=continue" in captured_cmd
     separator = captured_cmd.index("--")
-    assert captured_cmd[separator + 1 :] == [sys.executable, "-m", "hermes_cli.kanban_worker_client"]
+    assert "--control-fd" in captured_cmd[separator + 1 :]
+    assert captured_cmd[-3:] == [sys.executable, "-m", "hermes_cli.kanban_worker_client"]
+    assert "INVOCATION_ID" not in captured_env
     assert task.assignee is not None
     assert captured_env["HERMES_PROFILE"] == task.assignee
     assert captured_env["HERMES_HOME"] == str(workspace.parent / ".hermes" / "profiles" / task.assignee)
@@ -164,16 +192,27 @@ def test_oneshot_unit_dispatcher_scope_wraps_or_warns_never_dooms_silently(
     class FakeProc:
         pid = 4243
 
-    monkeypatch.setattr(subprocess, "Popen", lambda cmd, **kwargs: spawned.append(list(cmd)) or FakeProc())
+    peers = []
+
+    def fake_popen(cmd, **kwargs):
+        spawned.append(list(cmd))
+        if fds := kwargs.get("pass_fds"):
+            peer = socket.socket(fileno=os.dup(fds[0]))
+            peers.append(peer)
+            peer.sendall(b"V")
+        return FakeProc()
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
     monkeypatch.setenv("INVOCATION_ID", "oneshot-dispatch-timer")
     monkeypatch.setattr(process_registry, "_is_supervised_gateway_process", lambda: False)
     monkeypatch.setattr(process_registry, "_systemd_run_user_scope_available", lambda: True)
-    monkeypatch.setattr(
-        process_registry, "_build_systemd_scope_argv",
-        lambda cmd, unit_suffix: ["systemd-run", "--user", "--scope", "--unit", f"hermes-worker-{unit_suffix}", *cmd],
-    )
+    monkeypatch.setattr("shutil.which", lambda _name: "systemd-run")
 
-    kbd._default_spawn(task, str(workspace))
+    try:
+        kbd._default_spawn(task, str(workspace))
+    finally:
+        for peer in peers:
+            peer.close()
     assert spawned[-1][:3] == ["systemd-run", "--user", "--scope"]
     assert f"hermes-worker-kanban-{task.id}-run-{task.current_run_id}" in spawned[-1]
 
