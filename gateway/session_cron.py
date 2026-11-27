@@ -9,6 +9,7 @@ from dataclasses import asdict, replace
 import json
 import os
 from pathlib import Path
+import sqlite3
 import threading
 
 from gateway.session_contract import SessionActor, SessionRef
@@ -129,16 +130,62 @@ async def _create(authority, actor, params):
             raise RuntimeStoreError('runtime_draining')
 
     def read_existing():
-        # Do not fall back to the writer or reopen a retired store in this worker.
+        # Generation samples bracket a single pinned pooled read. An unavailable
+        # snapshot is not an absent session.
+        before = db._write_generation()
         with db.transcript_read_snapshot() as snapshot:
-            return db.get_session(sid) if snapshot.pinned else None
+            if not snapshot.pinned:
+                return None
+            existing = db.get_session(sid) is not None
+            consistent = snapshot()
+        after = db._write_generation()
+        return (existing, after) if consistent and before == after else None
 
-    read_task = track_mutation(authority, asyncio.to_thread(read_existing))
-    await asyncio.shield(read_task)
-    check_current()
-    # The worker result is advisory. Until a publication witness is available,
-    # use the original owner-side check for the exact-retry decision.
-    if db.get_session(sid) is not None:
+    def qualified_existing(prepared):
+        # Order the decision against both this connection's writes and external
+        # SQLite commits. Never block on the Python writer mutex or SQLite lock.
+        if prepared is None or not db._lock.acquire(blocking=False):
+            return None
+        conn = db._conn
+        previous = None
+        began = False
+        try:
+            if conn is None or conn is not prepared[1][0] or conn.in_transaction:
+                return None
+            previous = conn.execute('PRAGMA busy_timeout').fetchone()[0]
+            conn.execute('PRAGMA busy_timeout=0')
+            try:
+                conn.execute('BEGIN IMMEDIATE')
+                began = True
+            except sqlite3.OperationalError:
+                return None
+            generation = (conn, conn.total_changes, conn.execute('PRAGMA main.data_version').fetchone()[0])
+            if generation != prepared[1]:
+                return None
+            from hermes_state_runtime import _epoch
+            _epoch(conn, epoch)
+            check_current()
+            return prepared[0]
+        finally:
+            try:
+                if began:
+                    conn.execute('ROLLBACK')
+            finally:
+                try:
+                    if previous is not None:
+                        conn.execute(f'PRAGMA busy_timeout={int(previous)}')
+                finally:
+                    db._lock.release()
+
+    async def existing_identity():
+        read_task = track_mutation(authority, asyncio.to_thread(read_existing))
+        prepared = await asyncio.shield(read_task)
+        check_current()
+        result = qualified_existing(prepared)
+        # Original owner path is the safe fallback, not an empty result.
+        return db.get_session(sid) is not None if result is None else result
+
+    if await existing_identity():
         return restore_local_session(authority, sid), request_id
     if ':' in execution_id:
         # Fresh admissions only: ``cron:<job>:<execution>`` then splits at its one ``:`` after the
@@ -166,7 +213,7 @@ async def _create(authority, actor, params):
     read_task = track_mutation(authority, asyncio.to_thread(prepare))
     policy, private = await asyncio.shield(read_task)
     check_current()
-    if db.get_session(sid) is not None:
+    if await existing_identity():
         return restore_local_session(authority, sid), request_id
     policy = bind_launch_key(authority, sid, policy, None, config_secrets=private)
     from gateway.session_local_recovery import local_source
