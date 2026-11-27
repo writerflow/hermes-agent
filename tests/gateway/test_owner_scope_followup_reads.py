@@ -168,6 +168,39 @@ def test_cron_create_editor_discovery_never_holds_db_writer_guard(mux, monkeypat
     assert observations == ['guard-free'], observations
 
 
+def test_cron_create_never_resolves_paths_inside_writer_guard(mux, monkeypatch):
+    import inspect
+    from cron import jobs
+    from gateway import session_cron
+
+    runner, homes, loop, call = mux
+    authority = runner.session_authorities.require(homes['beta'])
+    with jobs.use_cron_store(homes['beta']):
+        job = jobs.create_job(prompt='report', schedule='every 1h', deliver='local', model='fixture')
+    import hermes_constants
+
+    class ColdCache(dict):
+        def get(self, key, default=None):
+            return default
+
+    # Cache eviction is permitted independently of this operation. Exercise the
+    # cold path rather than treating a warm process cache as a safety guarantee.
+    monkeypatch.setattr(hermes_constants, '_HOME_KEY_CACHE', ColdCache())
+    resolved_under_guard = []
+    real_resolve = Path.resolve
+
+    def probe(path, *args, **kwargs):
+        if any(frame.function == 'qualified_existing' for frame in inspect.stack()):
+            resolved_under_guard.append(str(path))
+        return real_resolve(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, 'resolve', probe)
+    result = call(session_cron.operation(authority, 'submit', {
+        'job_id': job['id'], 'request_id': 'guard-path', 'extra_prompt': None}))
+    assert authority.db.get_session(result['session_id']) is not None
+    assert not resolved_under_guard, f'path resolution inside DB guard: {resolved_under_guard}'
+
+
 def test_cron_create_refuses_drain_during_job_read(mux, monkeypatch):
     from cron import jobs
     from gateway import session_cron
