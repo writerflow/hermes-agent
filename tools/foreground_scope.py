@@ -198,38 +198,44 @@ class _PinnedScope:
     def is_empty(self) -> bool:
         return self._events()[0] == b"0"
 
-    def _wait_for_event(self, index: int, value: bytes, deadline: float) -> bool:
+    def _wait_for_event(self, index: int, value: bytes, remaining: Callable[[], float]) -> bool:
         while self._events()[index] != value:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
+            left = remaining()
+            if left <= 0:
                 return False
-            time.sleep(min(remaining, 0.01))
+            time.sleep(min(left, 0.01))
         return True
 
-    def drain(self, *, timeout: float = _CLEANUP_TIMEOUT, deadline: float | None = None) -> str | None:
+    def drain(self, *, timeout: float = _CLEANUP_TIMEOUT, deadline: float | None = None,
+              should_yield: Callable[[], bool] | None = None) -> str | None:
         # Admission owns these FDs. No fresh unit or path resolution may grant
         # authority; an invalidated original descriptor only permits refusal.
         stop_by = time.monotonic() + timeout
         deadline = stop_by if deadline is None else min(deadline, stop_by)
-        if time.monotonic() >= deadline:
-            return "original scope cleanup deadline expired"
+        def remaining() -> float:
+            return 0.0 if should_yield is not None and should_yield() else deadline - time.monotonic()
+
+        if remaining() <= 0:
+            return "original scope cleanup interrupted or deadline expired"
         try:
             populated, frozen = self._events()
             if populated == b"0":
                 return None
             if frozen != b"0":
                 return "original scope already frozen"
+            if remaining() <= 0:
+                return "original scope cleanup interrupted or deadline expired"
             try:
                 _write_control(self.freeze, b"1")
-                if not self._wait_for_event(1, b"1", deadline):
+                if not self._wait_for_event(1, b"1", remaining):
                     return "original scope still populated; freeze unconfirmed"
-                if not _verified_frozen_members(self, deadline) or self._events()[1] != b"1":
+                if not _verified_frozen_members(self, remaining) or self._events()[1] != b"1" or remaining() <= 0:
                     return "original scope member provenance unverified"
                 try:
                     _write_control(self.kill, b"1")
                 except OSError:
                     return "original scope stop control write failed"
-                if not self._wait_for_event(0, b"0", deadline):
+                if not self._wait_for_event(0, b"0", remaining):
                     return "original scope still populated after teardown"
             finally:
                 # Always release our own freeze request, even on refusal.
@@ -369,15 +375,15 @@ def _write_control(fd: int, value: bytes) -> None:
         raise OSError("incomplete scope control write")
 
 
-def _member_snapshot(directory: int, path: str, mount: int, deadline: float,
+def _member_snapshot(directory: int, path: str, mount: int, remaining: Callable[[], float],
                      members: dict[int, tuple[int, int]]) -> None:
-    if time.monotonic() >= deadline or _fd_mount_id(directory) != mount:
+    if remaining() <= 0 or _fd_mount_id(directory) != mount:
         raise ValueError("scope traversal unverified")
     fd = os.open("cgroup.procs", os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=directory)
     with os.fdopen(fd, encoding="ascii") as file:
         for line in file:
             pid = int(line)
-            if time.monotonic() >= deadline or pid <= 0 or pid in members:
+            if remaining() <= 0 or pid <= 0 or pid in members:
                 raise ValueError("scope membership changed")
             snapshot = _process_parent_birth(pid)
             if _unified_membership(pid) != path or _process_parent_birth(pid) != snapshot:
@@ -389,15 +395,15 @@ def _member_snapshot(directory: int, path: str, mount: int, deadline: float,
             if entry.is_dir(follow_symlinks=False):
                 child = os.open(entry.name, flags, dir_fd=directory)
                 try:
-                    _member_snapshot(child, f"{path}/{entry.name}", mount, deadline, members)
+                    _member_snapshot(child, f"{path}/{entry.name}", mount, remaining, members)
                 finally:
                     os.close(child)
 
 
-def _verified_frozen_members(scope: _PinnedScope, deadline: float) -> bool:
+def _verified_frozen_members(scope: _PinnedScope, remaining: Callable[[], float]) -> bool:
     path, mount = scope.placement[2], scope.handle[0]
     members: dict[int, tuple[int, int]] = {}
-    _member_snapshot(scope.directory, path, mount, deadline, members)
+    _member_snapshot(scope.directory, path, mount, remaining, members)
     anchor, birth = scope.anchor
     if anchor not in members or members[anchor][1] != birth:
         return False
@@ -408,7 +414,7 @@ def _verified_frozen_members(scope: _PinnedScope, deadline: float) -> bool:
     for pid in members:
         chain = set()
         while pid not in owned:
-            if pid not in members or pid in chain or time.monotonic() >= deadline:
+            if pid not in members or pid in chain or remaining() <= 0:
                 return False
             chain.add(pid)
             parent, birth = members[pid]
@@ -419,8 +425,8 @@ def _verified_frozen_members(scope: _PinnedScope, deadline: float) -> bool:
     # A freeze does not prevent external cgroup writers from moving a process.
     # Reject any drift we observe; this is not a sandbox for other writers.
     current: dict[int, tuple[int, int]] = {}
-    _member_snapshot(scope.directory, path, mount, deadline, current)
-    return current == members and time.monotonic() < deadline
+    _member_snapshot(scope.directory, path, mount, remaining, current)
+    return current == members and remaining() > 0
 
 
 def _verify_held_members(directory: int, path: str, launcher: tuple[int, int],
@@ -491,6 +497,7 @@ class _HeldAdmission:
         self._closed = False
         self._original: _PinnedScope | None = None
         self._drained = False
+        self._force_requested = False
 
     def verify_and_release(self, proc: subprocess.Popen, unit: str) -> None:
         try:
@@ -543,6 +550,8 @@ class _HeldAdmission:
                 self._channel.shutdown(socket.SHUT_RDWR)
 
     def force_cleanup(self, unit: str, deadline: float | None) -> None:
+        # The current owner must finish thawing before this caller can exit.
+        self._force_requested = True
         stop_by = time.monotonic() + 0.15
         deadline = stop_by if deadline is None else min(deadline, stop_by)
         if not self._fence.acquire(blocking=False):
@@ -596,7 +605,8 @@ class _HeldAdmission:
             # but must not close the pin until this explicit stop has used it.
             with suppress(OSError):
                 prepare()
-        reason = self._original.drain(timeout=timeout, deadline=deadline)
+        should_yield = (lambda: self._force_requested) if deadline is None else None
+        reason = self._original.drain(timeout=timeout, deadline=deadline, should_yield=should_yield)
         self._drained = reason is None
         if self._drained and prepare is not None:
             self._close_original()

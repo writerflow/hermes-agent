@@ -162,7 +162,7 @@ class _FixturePin:
     def is_empty(self):
         return True
 
-    def drain(self, *, timeout, deadline=None):
+    def drain(self, *, timeout, deadline=None, should_yield=None):
         return None
 
 
@@ -1081,6 +1081,51 @@ class TestScopeLifecycle:
                     child.settimeout(3)
                     assert child.recv(1) == b"", "hard exit left the payload gate open"
                     assert proc.wait(timeout=3) < 0
+
+    def test_hard_exit_releases_an_in_progress_scope_freeze(self, make_env, monkeypatch, tmp_path):
+        from socket import socketpair
+
+        from tools.environments import base
+
+        freeze_requested = Event()
+        freeze_path = tmp_path / "freeze"
+        events_path = tmp_path / "events"
+        events_path.write_bytes(b"populated 1\nfrozen 0\n")
+        real_write = fs._write_control
+        monkeypatch.setattr(base, "_exit_fenced", False)
+        env = make_env()
+        with ExitStack() as files:
+            proc = files.enter_context(subprocess.Popen(["sleep", "30"], start_new_session=True))
+            files.callback(proc.kill)
+            parent, child = socketpair()
+            files.enter_context(parent)
+            files.enter_context(child)
+            events = files.enter_context(events_path.open("rb"))
+            freeze = files.enter_context(freeze_path.open("w+b"))
+            stop = files.enter_context((tmp_path / "stop").open("w+b"))
+            admission = fs._HeldAdmission(parent)
+            admission._original = fs._PinnedScope(
+                "boot", (proc.pid, 10), (1, 11), ("bus", ":1.2", "/scope", "12" * 16, 1),
+                (17, 1), -1, events.fileno(), freeze.fileno(), stop.fileno(), ExitStack())
+            setattr(proc, "_hermes_scope_admission", admission)
+            setattr(proc, "_hermes_scope_unit", "held.scope")
+            monkeypatch.setitem(base._live_foreground, id(proc), (env, proc))
+
+            def write_control(fd, value):
+                real_write(fd, value)
+                if fd == freeze.fileno() and value == b"1":
+                    freeze_requested.set()
+
+            monkeypatch.setattr(fs, "_write_control", write_control)
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                cleanup = pool.submit(fs.cleanup_original, proc, timeout=3)
+                assert freeze_requested.wait(5), "ordinary cleanup did not request a freeze"
+                assert base.kill_live_foreground_processes(now=True) == 1
+                # A caller really exits here; thawing later on the cleanup thread is too late.
+                assert freeze_path.read_bytes() == b"0"
+                assert stop.read() == b""
+                assert proc.wait(timeout=3) < 0
+                cleanup.result(timeout=3)
 
     def test_timeout_stops_the_whole_scope(self, worker_host, fg_config, real_systemd_stub, make_env, monkeypatch):
         fg_config()
