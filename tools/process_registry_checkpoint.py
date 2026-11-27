@@ -34,10 +34,10 @@ class ProcessCheckpointMixin:
         try:
             with self._lock:
                 entries = []
-                for s in self._running.values():
+                for s in (*self._running.values(), *self._finished.values()):
                     # A hosted agent's process is not this host's to persist: its record (command,
                     # cwd, owner) stays in memory, whoever triggers the write (scoped or not).
-                    if s.exited or s.sandbox_key:
+                    if s.sandbox_key or (s.exited and not (s.original_scope_required and s._scope_stop_pending)):
                         continue
                     # Backfill the start time so recovery can detect PID recycling
                     # even for sessions spawned before this field existed.
@@ -69,8 +69,7 @@ class ProcessCheckpointMixin:
             logger.debug("Failed to write checkpoint file: %s", e, exc_info=True)
 
     def _foreign_handoffs(self, path, known) -> list[dict[str, Any]]:
-        """On-disk worker handoffs this registry never tracked whose log still decides an outcome:
-        the process is alive (same start time) or its recorded exit is waiting to be read."""
+        """Preserve untracked original-scope receipts and worker handoffs with pending output."""
         from pathlib import Path
         from tools.process_registry_output_log import _exit_path, adoptable_log
         try:
@@ -78,9 +77,10 @@ class ProcessCheckpointMixin:
         except (OSError, ValueError):
             return []
         return [entry for entry in on_disk if isinstance(entry, dict) and entry.get("session_id") not in known
-                and (log := adoptable_log(entry.get("output_log"))) and Path(log).exists()
-                and (_exit_path(log).exists() or self._detached_host_fate(
-                    entry.get("pid"), entry.get("host_start_time")) == "running")]
+                and (entry.get("original_scope_required") is True
+                     or ((log := adoptable_log(entry.get("output_log"))) and Path(log).exists()
+                         and (_exit_path(log).exists() or self._detached_host_fate(
+                             entry.get("pid"), entry.get("host_start_time")) == "running")))]
 
     def recover_from_checkpoint(self) -> int:
         """On gateway startup, probe PIDs from the checkpoint file; returns how many
@@ -110,7 +110,8 @@ class ProcessCheckpointMixin:
             # The registry is process-global, so every profile's checkpoint carries every live
             # process; a multiplexer recovering several homes must adopt each session once.
             with self._lock:
-                already_tracked = entry.get("session_id") in self._running
+                sid = entry.get("session_id")
+                already_tracked = sid in self._running or sid in self._finished
             if already_tracked:
                 continue
             if pid_scope != "host":  # in-sandbox PIDs mean nothing once the env handle is gone
@@ -129,14 +130,15 @@ class ProcessCheckpointMixin:
             log = adoptable_log(entry.get("output_log"))
             if log:
                 fate = "running"
-            if fate == "reused":
+            scope_held = entry.get("original_scope_required") is True and fate != "running"
+            if fate == "reused" and not scope_held:
                 logger.info(
                     "Not recovering session %s: pid %d is alive but its "
                     "start time no longer matches — PID was recycled onto "
                     "an unrelated process; refusing to adopt or signal it.",
                     entry.get("session_id", "?"), pid)
                 continue
-            if fate != "running":
+            if fate != "running" and not scope_held:
                 systemd_unit = entry.get("systemd_unit", "")
                 if systemd_unit and not _stop_systemd_unit(systemd_unit):
                     logger.warning(
@@ -154,6 +156,15 @@ class ProcessCheckpointMixin:
             # (and recorded exit) outlives its spawner, so tail it from the start.
             fields["output_log"] = log
             session = ProcessSession(id=entry["session_id"], detached=True, **fields)
+            if scope_held:
+                session.exited = True  # launcher gone, no collected exit status
+                session._scope_stop_pending = True
+                session._completion_event.set()
+                with self._lock:
+                    self._finished[session.id] = session
+                recovered += 1
+                logger.warning("Cleanup incomplete for %s: original scope handle unavailable", session.id)
+                continue
             if session.output_log:
                 self._track_started(session, self._log_reader_loop, f"proc-log-reader-{session.id}")
             else:

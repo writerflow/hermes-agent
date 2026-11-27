@@ -1012,13 +1012,17 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
         fate = self._detached_host_fate(session.pid, session.host_start_time)
         if fate == "running":
             return session
+        if session.original_scope_required:
+            # Launcher exit says nothing about the descendants of the original scope.
+            self._close_uncollected_detached(session)
+            return session
         if fate == "gone":
             return self._prune_uncollected_detached(session)
-        self._close_reused_detached(session)
+        self._close_uncollected_detached(session)
         return session
 
-    def _close_reused_detached(self, session: ProcessSession) -> None:
-        """Close an entry whose PID was recycled onto another process.
+    def _close_uncollected_detached(self, session: ProcessSession) -> None:
+        """Close an entry whose original launcher is gone or whose PID was recycled.
 
         The stranger is not signalled, and no completion is queued: we never
         collected an exit status for the process we spawned.
@@ -1026,6 +1030,8 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
         with session._lock:
             if session.exited:
                 return
+            if session.original_scope_required:
+                session._scope_stop_pending = True
             session.exited = True
         with self._lock:
             if session.id in self._running:
@@ -2283,7 +2289,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
                 # No waitable handle, so this is not a collected exit. Close the
                 # entry without queueing a completion, and do not signal a PID
                 # whose start time does not match.
-                self._close_reused_detached(session)
+                self._close_uncollected_detached(session)
                 result = {"status": "already_exited", "exit_code": session.exit_code, **output}
                 if not scope_stopped:
                     result["scope_stop_failed"] = session.systemd_unit
