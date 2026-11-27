@@ -1399,9 +1399,9 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
     def _wait_for_local_reader(proc: subprocess.Popen) -> None:
         proc.wait()
         if getattr(proc, "_hermes_scope_adopted", False):
-            from tools.foreground_scope import close_admission
+            from tools.foreground_scope import finish_adopted_scope
 
-            close_admission(proc)
+            finish_adopted_scope(proc)
 
     def _finish_reader(self, session, decoder, append, label, wait, exit_code) -> None:
         """Reader-thread teardown: flush the decoder (a truncated multibyte tail becomes
@@ -2575,7 +2575,12 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
             # directly (defensive paths, historical checkpoints) would
             # otherwise carry its OS handles to the grave unreleased. The
             # release is idempotent, so double-closing is safe.
-            self._release_finished_handles(self._finished[sid])
+            session = self._finished[sid]
+            self._release_finished_handles(session)
+            if getattr(session.process, "_hermes_scope_adopted", False):
+                from tools.foreground_scope import close_admission
+
+                close_admission(session.process)
             del self._finished[sid]
         # Belt-and-suspenders against module-lifetime growth: forget consumed /
         # poll-observed marks for any session no longer tracked at all.

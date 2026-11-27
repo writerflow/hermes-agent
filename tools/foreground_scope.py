@@ -195,6 +195,9 @@ class _PinnedScope:
             values.append(row[1])
         return values[0], values[1]
 
+    def is_empty(self) -> bool:
+        return self._events()[0] == b"0"
+
     def _wait_for_event(self, index: int, value: bytes, deadline: float) -> bool:
         while self._events()[index] != value:
             remaining = deadline - time.monotonic()
@@ -533,9 +536,18 @@ class _HeldAdmission:
     def close(self) -> None:
         self.cancel()
         with self._fence:
-            if self._original is not None:
-                self._original.close()
-                self._original = None
+            self._close_original()
+
+    def _close_original(self) -> None:
+        if self._original is not None:
+            self._original.close()
+            self._original = None
+
+    def release_if_empty(self) -> None:
+        with self._fence, suppress(OSError, ValueError):
+            if self._original is not None and self._original.is_empty():
+                self._drained = True
+                self._close_original()
 
     def cleanup_original(self, unit: str, *, timeout: float,
                          prepare: Callable[[], None] | None = None) -> str | None:
@@ -551,6 +563,8 @@ class _HeldAdmission:
                     prepare()
             reason = self._original.drain(timeout=timeout)
             self._drained = reason is None
+            if self._drained and prepare is not None:
+                self._close_original()
         if reason is not None:
             logger.warning("Foreground scope %s: cleanup incomplete: %s", unit, reason)
         return reason
@@ -679,6 +693,13 @@ def stop_adopted_scope(proc: subprocess.Popen, prepare: Callable[[], None]) -> s
     admission: _HeldAdmission = getattr(proc, "_hermes_scope_admission")
     admission.cancel()
     return admission.cleanup_original(scope_unit_of(proc), timeout=_CLEANUP_TIMEOUT, prepare=prepare)
+
+
+def finish_adopted_scope(proc: subprocess.Popen) -> None:
+    admission: _HeldAdmission = getattr(proc, "_hermes_scope_admission")
+    # Reading the original scope is safe here, but normal completion must not
+    # stop descendants. Keep a nonempty or unreadable pin for explicit stop.
+    admission.release_if_empty()
 
 
 def wrapper_diagnostic(proc: subprocess.Popen, returncode: int | None) -> tuple[str, bool]:

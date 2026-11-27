@@ -159,6 +159,9 @@ class _FixturePin:
     def close(self):
         pass
 
+    def is_empty(self):
+        return True
+
     def drain(self, *, timeout):
         return None
 
@@ -857,7 +860,7 @@ class TestScopeLifecycle:
         assert any("cleanup incomplete: original scope still populated" in report for report in reports) == populated
 
     @pytest.mark.parametrize("member_owned", [True, False])
-    @pytest.mark.parametrize("route", ["timeout", "hard-exit", "yield-stop"])
+    @pytest.mark.parametrize("route", ["timeout", "hard-exit", "yield-stop", "yield-exited"])
     def test_cleanup_checks_frozen_recursive_members_before_stopping_original(
         self, member_owned, route, worker_host, fg_config, stub, make_env, monkeypatch, tmp_path, caplog,
     ):
@@ -871,6 +874,7 @@ class TestScopeLifecycle:
             (replacement / path).touch()
         child_pid = 2**30
         real_pread = os.pread
+        pin_closed = []
 
         def pin_original(proc, unit, invocation_id, anchor_pid):
             scope_path = f"/app.slice/{unit}"
@@ -885,6 +889,7 @@ class TestScopeLifecycle:
                     files.callback(os.close, fd)
                     fds.append(fd)
                 events, freeze, kill = fds
+                files.callback(pin_closed.append, True)
                 replacement.rename(original)
                 replacement.mkdir()
                 for name in ("freeze", "kill"):
@@ -909,23 +914,53 @@ class TestScopeLifecycle:
         monkeypatch.setattr(fs, "_pin_original", pin_original)
         env = make_env()
         command = f"touch '{marker}'; exec sleep 30"
-        if route == "yield-stop":
+        if route in ("yield-stop", "yield-exited"):
             from tools.environments import base
+            from tests.waiting import wait_until
             from tools.terminal_tool_background import yield_to_background_handler
 
             monkeypatch.setattr(base, "consume_yield", lambda _: marker.is_file())
+            finish = tmp_path / "finish"
+            if route == "yield-exited":
+                command = f"touch '{marker}'; while [ ! -e '{finish}' ]; do sleep .02; done; exit 7"
             handler = yield_to_background_handler(
                 command=command, env_type="local", cwd=None, effective_task_id="fg-scope-stop",
                 task_id="fg-scope-stop", session_key="")
             proc = env._run_bash(command, resource_scope=True)
             try:
                 yielded = env._wait_for_process(proc, timeout=5, yield_handler=handler)
-                result = pr.process_registry.kill_process(yielded["yielded_session_id"])
+                session_id = yielded["yielded_session_id"]
+                if route == "yield-exited":
+                    session = pr.process_registry.get(session_id)
+                    assert session is not None
+                    reader = session._reader_thread
+                    assert reader is not None
+                    finish.touch()
+                    assert wait_until(lambda: not reader.is_alive(), timeout=5)
+                    assert session.exited and session.exit_code == 7
+                    assert (original / "cgroup.kill").read_bytes() == b""
+                    assert not pin_closed, "the populated scope must remain available for explicit stop"
+                expected = "already_exited" if route == "yield-exited" else "killed"
+                result = pr.process_registry.kill_process(session_id)
                 assert (original / "cgroup.kill").read_bytes() == (b"1" if member_owned else b"")
-                assert result["status"] == ("killed" if member_owned else "error"), result
+                assert result["status"] == (expected if member_owned else "error"), result
+                if route == "yield-exited":
+                    repeated = pr.process_registry.kill_process(session_id)
+                    assert repeated["status"] == result["status"], repeated
+                    if member_owned:
+                        assert repeated["exit_code"] == 7
+                        assert pin_closed == [True]
+                    else:
+                        assert "provenance unverified" in repeated["error"], repeated
+                        assert not pin_closed
+                        monkeypatch.setattr(pr, "FINISHED_TTL_SECONDS", -1)
+                        with pr.process_registry._lock:
+                            pr.process_registry._prune_if_needed()
+                        assert pin_closed == [True]
             finally:
                 proc.kill()
                 proc.wait(timeout=5)
+                fs.close_admission(proc)
         elif route == "hard-exit":
             from tests.waiting import wait_until
             from tools.environments import base
