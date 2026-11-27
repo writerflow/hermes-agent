@@ -14,9 +14,23 @@ from tools import process_registry, work_scope
 
 @pytest.mark.platforms("linux")
 @pytest.mark.parametrize("use_pty", [False, True], ids=["pipe", "pty"])
-@pytest.mark.parametrize("outcome", ["refused", "admitted", "write failed"])
+@pytest.mark.parametrize("outcome", ["refused", "admitted", "write failed", "birth changed"])
 def test_background_payload_waits_for_scope_verification(monkeypatch, tmp_path, use_pty, outcome):
+    launcher_admits = outcome in {"admitted", "birth changed"}
     verified = outcome == "admitted"
+    if outcome == "birth changed":
+        read_text = Path.read_text
+
+        def read_stat(path, *args, **kwargs):
+            contents = read_text(path, *args, **kwargs)
+            if path.parent.parent == Path("/proc") and path.name == "stat" and manager_log.exists():
+                prefix, fields = contents.rsplit(")", 1)
+                values = fields.split()
+                values[19] = str(int(values[19]) + 1)
+                return prefix + ") " + " ".join(values)
+            return contents
+
+        monkeypatch.setattr(Path, "read_text", read_stat)
     placement_dir = tmp_path / "work-scope-placements"
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     if outcome == "write failed":
@@ -50,7 +64,7 @@ if len(command) > 2 and command[2] == {str(Path(work_scope.__file__).resolve())!
         assert 'INVOCATION_ID' not in os.environ
         with log.open('a') as stream:
             stream.write('checked\\n')
-        if not {verified!r}:
+        if not {launcher_admits!r}:
             raise entry.__globals__['ScopeVerificationError']('scope policy refused')
     entry.__globals__['_verify_scope_launch'] = verify
     sys.exit(entry(command[3], command[4:]))
