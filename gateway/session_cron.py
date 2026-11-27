@@ -101,15 +101,14 @@ def _actor(authority, actor):
     return SessionActor(CRON_PRINCIPAL_ID, authority.profile_id, actor.capabilities, actor.transport_id)
 
 
-def _create(authority, actor, params):
-    from cron.jobs import get_job
+async def _create(authority, actor, params):
     from gateway.session_local_recovery import local_identity, restore_local_session
     from gateway.session_policy import build_policy, bind_launch_key
-    from gateway.run import _load_gateway_config
-    from cron.scheduler import _load_cron_job_config
     from gateway.config import Platform
     from gateway.session import SessionSource, SessionEntry
     from gateway.session_lifecycle import _now
+    from gateway.session_authorities import require_serving
+    from gateway.session_runtime_workers import track_mutation
 
     if set(params) != {'job_id', 'request_id', 'extra_prompt'}:
         raise RuntimeStoreError('invalid_params')
@@ -119,24 +118,56 @@ def _create(authority, actor, params):
         raise RuntimeStoreError('invalid_params')
     execution_id, request_id = request_id, cron_request_id(jid, request_id)
     sid = local_identity(authority.profile_id, actor.subject, request_id)
-    if authority.db.get_session(sid) is not None:
+    db, epoch = authority.db, authority.epoch
+
+    def check_current():
+        require_serving(authority)
+        authority._require_admission_open()
+        registry = getattr(authority.runner, 'session_authorities', None)
+        if (authority.db is not db or authority.epoch != epoch
+                or (registry is not None and registry.for_home(authority.profile_id) is not authority)):
+            raise RuntimeStoreError('runtime_draining')
+
+    def read_existing():
+        # Do not fall back to the writer or reopen a retired store in this worker.
+        with db.transcript_read_snapshot() as snapshot:
+            return db.get_session(sid) if snapshot.pinned else None
+
+    read_task = track_mutation(authority, asyncio.to_thread(read_existing))
+    await asyncio.shield(read_task)
+    check_current()
+    # The worker result is advisory. Until a publication witness is available,
+    # use the original owner-side check for the exact-retry decision.
+    if db.get_session(sid) is not None:
         return restore_local_session(authority, sid), request_id
     if ':' in execution_id:
         # Fresh admissions only: ``cron:<job>:<execution>`` then splits at its one ``:`` after the
         # job. Ledger ids are hex, so only a hand-made id has one; an identity admitted before this
         # guard keeps its exact retry above, and run history files it by its stored policy.
         raise RuntimeStoreError('invalid_params')
-    job = get_job(jid)
-    if job is None or job.get('no_agent'):
-        raise RuntimeStoreError('not_found')
-    config = _load_gateway_config()
-    private = {}
-    launch = {'source': 'cli', 'request_id': request_id, 'toolsets': []}
-    if job.get('workdir'):
-        launch['cwd'] = job['workdir']
-    policy = build_policy(launch, config, private_secrets=private)
-    policy = replace(policy, source='cron', platform='cron', model=_load_cron_job_config(job, jid, job.get('name') or jid).model,
-                     request_json=json.dumps({'cron_job': job, 'extra_prompt': extra, 'request_id': request_id}))
+    def prepare():
+        from cron.jobs import get_job
+        from cron.scheduler import _load_cron_job_config
+        from gateway.run import _load_gateway_config
+        job = get_job(jid)
+        if job is None or job.get('no_agent'):
+            raise RuntimeStoreError('not_found')
+        config = _load_gateway_config()
+        private = {}
+        launch = {'source': 'cli', 'request_id': request_id, 'toolsets': []}
+        if job.get('workdir'):
+            launch['cwd'] = job['workdir']
+        policy = build_policy(launch, config, private_secrets=private)
+        policy = replace(policy, source='cron', platform='cron',
+                         model=_load_cron_job_config(job, jid, job.get('name') or jid).model,
+                         request_json=json.dumps({'cron_job': job, 'extra_prompt': extra, 'request_id': request_id}))
+        return policy, private
+
+    read_task = track_mutation(authority, asyncio.to_thread(prepare))
+    policy, private = await asyncio.shield(read_task)
+    check_current()
+    if db.get_session(sid) is not None:
+        return restore_local_session(authority, sid), request_id
     policy = bind_launch_key(authority, sid, policy, None, config_secrets=private)
     from gateway.session_local_recovery import local_source
     source = local_source(authority, sid, actor.subject)
@@ -201,7 +232,7 @@ async def operation(authority, name, params, actor=None):
         prepared = await prepare_owner_scope(authority)
         authority._require_admission_open()
         with bind_prepared_owner_scope(authority, prepared):
-            ref, request_id = _create(authority, actor, params)
+            ref, request_id = await _create(authority, actor, params)
         from functools import partial
         from gateway.session_runtime_workers import tracked_write
         if isinstance(ref, dict):
