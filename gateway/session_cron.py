@@ -179,11 +179,11 @@ async def _create(authority, actor, params):
                 finally:
                     db._lock.release()
 
-    async def existing_identity(on_absent=None):
+    async def existing_identity(on_absent=None, *, guard_publication=True):
         read_task = track_mutation(authority, asyncio.to_thread(read_existing))
         prepared = await asyncio.shield(read_task)
         check_current()
-        result = qualified_existing(prepared, on_absent)
+        result = qualified_existing(prepared, on_absent) if guard_publication else None
         # Original owner path is the safe fallback, not an empty result.
         if result is None:
             existing = db.get_session(sid) is not None
@@ -229,7 +229,10 @@ async def _create(authority, actor, params):
         return {'profile_id': authority.profile_id, 'principal_id': actor.subject, 'request_id': request_id,
                 'session_id': sid, 'route': route, 'entry': entry.to_dict(), 'policy': asdict(bound)}
 
-    decision = await existing_identity(stage_absent)
+    # Editor discovery and secret-reference path resolution may perform I/O.
+    # Keep all private-config binding on the original owner path, never inside
+    # the SQLite publication barrier.
+    decision = await existing_identity(stage_absent, guard_publication=not private)
     if decision is True:
         return restore_local_session(authority, sid), request_id
     if not isinstance(decision, dict):
