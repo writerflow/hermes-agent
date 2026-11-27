@@ -185,10 +185,11 @@ async def _create(authority, actor, params):
                 finally:
                     db._lock.release()
 
-    async def existing_identity(on_absent=None, *, guard_publication=True):
+    async def existing_identity(on_absent_factory=None, *, guard_publication=True):
         read_task = track_mutation(authority, asyncio.to_thread(read_existing))
         prepared = await asyncio.shield(read_task)
         check_current()
+        on_absent = on_absent_factory() if on_absent_factory is not None else None
         result = qualified_existing(prepared, on_absent) if guard_publication else None
         # Original owner path is the safe fallback, not an empty result.
         if result is None:
@@ -224,24 +225,26 @@ async def _create(authority, actor, params):
     read_task = track_mutation(authority, asyncio.to_thread(prepare))
     policy, private = await asyncio.shield(read_task)
     check_current()
-    # Resolve the owner profile and route before acquiring the database guard:
-    # both helpers may perform filesystem lookups on a cold cache.
-    from gateway.session_local_recovery import local_source
-    source = local_source(authority, sid, actor.subject)
-    route = authority.runner.session_store._generate_session_key(source)
+    def prepare_stage():
+        # Resolve after the identity hop, but outside the guard: these helpers
+        # may perform filesystem lookups on a cold cache.
+        from gateway.session_local_recovery import local_source
+        source = local_source(authority, sid, actor.subject)
+        route = authority.runner.session_store._generate_session_key(source)
 
-    def stage_absent():
-        bound = bind_launch_key(authority, sid, policy, None, config_secrets=private)
-        now = _now()
-        entry = SessionEntry(route, sid, now, now, origin=source, platform=Platform.LOCAL)
-        # The receipt is committed separately by operation('submit').
-        return {'profile_id': authority.profile_id, 'principal_id': actor.subject, 'request_id': request_id,
-                'session_id': sid, 'route': route, 'entry': entry.to_dict(), 'policy': asdict(bound)}
+        def stage_absent():
+            bound = bind_launch_key(authority, sid, policy, None, config_secrets=private)
+            now = _now()
+            entry = SessionEntry(route, sid, now, now, origin=source, platform=Platform.LOCAL)
+            # The receipt is committed separately by operation('submit').
+            return {'profile_id': authority.profile_id, 'principal_id': actor.subject, 'request_id': request_id,
+                    'session_id': sid, 'route': route, 'entry': entry.to_dict(), 'policy': asdict(bound)}
+        return stage_absent
 
     # Editor discovery and secret-reference path resolution may perform I/O.
     # Keep all private-config binding on the original owner path, never inside
     # the SQLite publication barrier.
-    decision = await existing_identity(stage_absent, guard_publication=not private)
+    decision = await existing_identity(prepare_stage, guard_publication=not private)
     if decision is True:
         return restore_local_session(authority, sid), request_id
     if not isinstance(decision, dict):
