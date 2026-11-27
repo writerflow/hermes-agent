@@ -80,11 +80,16 @@ def close_stdio():
         os.close(fd)
 
 def reap_payload(gate, status_fd):
+    # Keep the ancestry root out of the command's process-group teardown,
+    # without moving either process out of the original scope.
+    command_group = os.getpgrp()
+    os.setpgid(0, 0)
     # PR_SET_CHILD_SUBREAPER: detached orphans stay attributable to this launch.
     if ctypes.CDLL(None).prctl(36, 1, 0, 0, 0) != 0:
         os._exit(125)
     payload = os.fork()
     if not payload:
+        os.setpgid(0, command_group)
         run_payload(gate, status_fd)
     gate.close()
     close_stdio()
@@ -423,7 +428,7 @@ class _HeldAdmission:
                         return data[header:], anchor_pid
         return None
 
-    def cancel(self) -> None:
+    def cancel(self) -> bool:
         # The verifier may be doing I/O. Serialize only the final release with
         # cancellation, never wait for verification while holding the fence.
         with self._fence:
@@ -431,6 +436,7 @@ class _HeldAdmission:
                 self._closed = True
                 with suppress(OSError):
                     self._channel.shutdown(socket.SHUT_RDWR)
+            return self._original is not None
 
     def close(self) -> None:
         self.cancel()
@@ -556,9 +562,10 @@ def start_admission(proc: subprocess.Popen, unit: str) -> None:
     thread.start()
 
 
-def cancel_admission(proc: object) -> None:
-    if (admission := getattr(proc, "_hermes_scope_admission", None)) is not None:
-        admission.cancel()
+def cancel_admission(proc: object) -> bool:
+    """Close the release gate; return whether cleanup owns a verified original."""
+    admission = getattr(proc, "_hermes_scope_admission", None)
+    return admission is not None and admission.cancel()
 
 
 def report_cleanup(proc: object) -> None:

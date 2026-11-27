@@ -552,18 +552,21 @@ class TestPropertySet:
 # --------------------------------------------------------------------------- T4: kill, timeout, yield
 @pytest.mark.platforms("linux")
 class TestScopeLifecycle:
-    def test_detached_child_keeps_owned_parent_after_command_exit(
-        self, worker_host, fg_config, stub, make_env, tmp_path,
+    @pytest.mark.parametrize("cancel", [False, True], ids=["normal-exit", "timeout"])
+    def test_detached_child_keeps_owned_parent_until_scope_cleanup(
+        self, cancel, worker_host, fg_config, stub, make_env, tmp_path,
     ):
         fg_config()
         script = tmp_path / "orphan.py"
         script.write_text(textwrap.dedent("""\
-            import os, socket, sys
+            import os, signal, socket, sys
 
             parent = os.getppid()
             intermediate = os.fork()
             if intermediate:
                 os.waitpid(intermediate, 0)
+                if sys.argv[2] == 'timeout':
+                    signal.pause()
                 print('payload finished', flush=True)
                 sys.exit(17)
             os.setsid()
@@ -579,14 +582,17 @@ class TestScopeLifecycle:
                     sock.sendall(b'!')
         """))
         address = b"\0hermes-test-" + os.urandom(16).hex().encode()
-        command = "exec " + shlex.join([sys.executable, str(script), address.hex()])
+        command = "exec " + shlex.join([
+            sys.executable, str(script), address.hex(), "timeout" if cancel else "normal",
+        ])
         with socket.socket(socket.AF_UNIX) as listener:
             listener.settimeout(5)
             listener.bind(address)
             listener.listen(1)
-            result = make_env().execute(command, resource_scope=True, timeout=5)
-            assert result["returncode"] == 17, result
-            assert result["output"].strip() == "payload finished"
+            result = make_env().execute(command, resource_scope=True, timeout=2 if cancel else 5)
+            assert result["returncode"] == (124 if cancel else 17), result
+            if not cancel:
+                assert result["output"].strip() == "payload finished"
             connection, _ = listener.accept()
             with connection, connection.makefile("rb") as info:
                 connection.settimeout(2)

@@ -1025,7 +1025,7 @@ def _leader_is_ours(pgid, expected_start) -> bool:
         return True
 
 
-def _kill_process_group_posix(proc) -> None:
+def _kill_process_group_posix(proc, *, sweep_detached: bool = True) -> None:
     """TERM the group, wait, KILL, then sweep setsid escapees. Descendants are
     snapshotted BEFORE the first signal — once the wrapper dies they reparent to
     init — and we wait on the group, not the wrapper, which can exit before
@@ -1047,14 +1047,15 @@ def _kill_process_group_posix(proc) -> None:
         descendants = []
         try:
             import psutil
-            descendants = psutil.Process(proc.pid).children(recursive=True)
+            if sweep_detached:
+                descendants = psutil.Process(proc.pid).children(recursive=True)
         except Exception:
             pass
         _sweep_escaped_descendants(descendants, pgid)
         return
     try:  # psutil children snapshot; empty on any failure (must never break the kill)
         import psutil
-        descendants = psutil.Process(proc.pid).children(recursive=True)
+        descendants = psutil.Process(proc.pid).children(recursive=True) if sweep_detached else []
     except Exception:
         descendants = []
     if pgid == os.getpgrp():
@@ -1322,9 +1323,13 @@ class LocalEnvironment(BaseEnvironment):
 
     def _kill_process(self, proc):
         """Kill the owned process tree; a requested scope name confers no cleanup authority."""
-        foreground_scope.cancel_admission(proc)
+        has_original = foreground_scope.cancel_admission(proc)
         try:
-            (_kill_process_windows if _IS_WINDOWS else _kill_process_group_posix)(proc)
+            if has_original:
+                # Detached members retain their verified parent for scope cleanup.
+                _kill_process_group_posix(proc, sweep_detached=False)
+            else:
+                (_kill_process_windows if _IS_WINDOWS else _kill_process_group_posix)(proc)
         except OSError:  # ProcessLookupError / PermissionError included
             with contextlib.suppress(Exception):
                 proc.kill()
