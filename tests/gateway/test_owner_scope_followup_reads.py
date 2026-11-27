@@ -75,7 +75,8 @@ def test_cron_create_exact_retry_reads_identity_off_loop_without_job(mux, monkey
     def probe(sql, params=()):
         import inspect
         stack = {frame.function for frame in inspect.stack()}
-        if '_create' in stack and 'restore_local_session' not in stack and 'FROM sessions' in sql and sid in params:
+        if (('_create' in stack or 'read_existing' in stack) and 'restore_local_session' not in stack
+                and 'FROM sessions' in sql and sid in params):
             reads.append(threading.get_ident())
         return real(sql, params)
 
