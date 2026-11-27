@@ -130,6 +130,54 @@ def test_cron_create_fences_independent_writer_at_binding(mux, monkeypatch):
     assert attempts == ['excluded'], f'independent writer entered before binding: {attempts}'
 
 
+def test_cron_create_invalidates_snapshot_after_independent_commit(mux, monkeypatch):
+    import sqlite3
+    from cron import jobs
+    from gateway import session_cron
+
+    runner, homes, loop, _ = mux
+    authority = runner.session_authorities.require(homes['beta'])
+    with jobs.use_cron_store(homes['beta']):
+        job = jobs.create_job(prompt='report', schedule='every 1h', deliver='local', model='fixture')
+    authority.db.create_session('independent-writer-probe', 'local')
+    sampled, release = threading.Event(), threading.Event()
+    real_generation = authority.db._write_generation
+    generations = []
+    def hold_after_snapshot():
+        value = real_generation()
+        generations.append(value)
+        if len(generations) == 4:
+            sampled.set()
+            if not release.wait(30):
+                raise TimeoutError('independent writer was not released')
+        return value
+    monkeypatch.setattr(authority.db, '_write_generation', hold_after_snapshot)
+    fallback_threads = []
+    original_get = authority.db.get_session
+    def get_session(sid):
+        import inspect
+        if any(frame.function == 'existing_identity' for frame in inspect.stack()):
+            fallback_threads.append(threading.get_ident())
+        return original_get(sid)
+    monkeypatch.setattr(authority.db, 'get_session', get_session)
+    future = asyncio.run_coroutine_threadsafe(session_cron.operation(authority, 'submit', {
+        'job_id': job['id'], 'request_id': 'independent-commit', 'extra_prompt': None}), loop)
+    try:
+        assert sampled.wait(30), 'second identity snapshot was not reached'
+        with sqlite3.connect(authority.db.db_path, timeout=5) as writer:
+            cursor = writer.execute("UPDATE sessions SET source='race-probe' WHERE id=?", ('independent-writer-probe',))
+            assert cursor.rowcount == 1
+            writer.commit()
+    finally:
+        release.set()
+    result = future.result(timeout=60)
+    assert authority.db.get_session(result['session_id']) is not None
+    async def owner_thread():
+        return threading.get_ident()
+    owner_ident = asyncio.run_coroutine_threadsafe(owner_thread(), loop).result(timeout=10)
+    assert owner_ident in fallback_threads, 'stale independent-commit snapshot was accepted without fallback'
+
+
 def test_cron_create_editor_discovery_never_holds_db_writer_guard(mux, monkeypatch):
     import sqlite3
     from cron import jobs
