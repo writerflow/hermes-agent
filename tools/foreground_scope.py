@@ -21,8 +21,9 @@ import subprocess
 import sys
 import tempfile
 import uuid
+from contextlib import ExitStack
 from dataclasses import dataclass
-from typing import Mapping
+from typing import BinaryIO, Mapping
 
 from hermes_cli.config import cfg_get, read_raw_config_readonly
 
@@ -46,9 +47,17 @@ _UNIT_TASK_CHARS = 8
 _WRAPPER_FAILURE = re.compile(r"Failed to (connect to (the )?(user )?bus|create bus connection|"
                               r"connect to user scope bus): [^\r\n]+", re.IGNORECASE)
 _MAX_WRAPPER_STDERR = 8192
-# Post-placement exec shim: close launcher stderr before any payload code runs.
-# Use the current interpreter in isolated mode, not a shell that can source startup files.
-_RESTORE_STDERR = "import os, sys; os.dup2(1, 2); os.execvp(sys.argv[1], sys.argv[1:])"
+# Record that the post-placement helper ran before allowing any payload code.
+# This byte vetoes replay; it does not prove successful placement or grant cleanup authority.
+_EXEC_PAYLOAD = """\
+import os, sys
+fd = int(sys.argv[1])
+if os.pwrite(fd, b'1', 0) != 1:
+    raise SystemExit(125)
+os.close(fd)
+os.dup2(1, 2)
+os.execvp(sys.argv[2], sys.argv[2:])
+"""
 # The one limit text a probe has confirmed: bash's fork failure under TasksMax (EAGAIN).
 _TASKS_LIMIT_TEXT = "Resource temporarily unavailable"
 LIMIT_NOTE = ("[hermes-worker-fg scope: this command hit the scope's task limit (TasksMax); to turn per-command "
@@ -69,6 +78,12 @@ class ScopedSpawn:
 class _Settings:
     enabled: bool
     gradle_mode: str
+
+
+@dataclass(frozen=True)
+class _LaunchStreams:
+    stderr: BinaryIO
+    entered: BinaryIO
 
 
 def foreground_scope_host() -> bool:
@@ -133,7 +148,7 @@ def scope_command(args: list[str], run_env: Mapping[str, str]) -> ScopedSpawn | 
     unit = _unit_name()
     no_expand = ["--expand-environment=no"] if _registry()._SYSTEMD_RUN_NO_EXPAND else []
     argv = [binary, "--user", "--scope", "--quiet", *no_expand, "--unit", unit, "--collect",
-            "--property", "MemoryAccounting=yes", "--", sys.executable, "-I", "-S", "-c", _RESTORE_STDERR, *args]
+            "--property", "MemoryAccounting=yes", "--", *args]
     env = _gradle_env(_registry().systemd_user_bus_env(dict(run_env)), settings.gradle_mode)
     return ScopedSpawn(argv, env, f"{unit}.scope")
 
@@ -146,26 +161,37 @@ def scope_unit_of(proc: object) -> str:
 
 
 def spawn_scoped(argv: list[str], **kwargs) -> subprocess.Popen:
-    """Capture only systemd-run's stderr; the exec shim re-merges payload stdout/stderr."""
-    diagnostics = tempfile.TemporaryFile(mode="w+b")
-    kwargs["stderr"] = diagnostics
-    try:
-        proc = subprocess.Popen(argv, **kwargs)
-    except BaseException:
-        diagnostics.close()
-        raise
-    setattr(proc, "_hermes_scope_stderr", diagnostics)
+    """Keep launcher diagnostics and the no-replay latch private from the payload."""
+    split = argv.index("--") + 1
+    with ExitStack() as files:
+        diagnostics = files.enter_context(tempfile.TemporaryFile(mode="w+b"))
+        entered = files.enter_context(tempfile.TemporaryFile(mode="w+b"))
+        fd = entered.fileno()
+        # Isolated interpreter: no user startup imports before the latch is set.
+        cmd = [*argv[:split], sys.executable, "-I", "-S", "-c", _EXEC_PAYLOAD, str(fd), *argv[split:]]
+        kwargs.update(stderr=diagnostics, pass_fds=(fd,))
+        proc = subprocess.Popen(cmd, **kwargs)
+        setattr(proc, "_hermes_scope_streams", _LaunchStreams(diagnostics, entered))
+        files.pop_all()
     return proc
 
 
 def wrapper_diagnostic(proc: subprocess.Popen, returncode: int | None) -> tuple[str, bool]:
     """Return diagnostics and whether they prove the legacy bus-open failure."""
-    diagnostics = getattr(proc, "_hermes_scope_stderr")
-    raw = os.pread(diagnostics.fileno(), _MAX_WRAPPER_STDERR + 1, 0)
+    streams: _LaunchStreams = getattr(proc, "_hermes_scope_streams")
+    raw = os.pread(streams.stderr.fileno(), _MAX_WRAPPER_STDERR + 1, 0)
     text = raw[:_MAX_WRAPPER_STDERR].decode("utf-8", "replace").removesuffix("\n")
     pre_start = (returncode == 1 and len(raw) <= _MAX_WRAPPER_STDERR
-                 and _WRAPPER_FAILURE.fullmatch(text) is not None)
+                 and _WRAPPER_FAILURE.fullmatch(text) is not None
+                 and not os.pread(streams.entered.fileno(), 1, 0))
     return text, pre_start
+
+
+def close_spawn_streams(proc: subprocess.Popen) -> None:
+    streams: _LaunchStreams = getattr(proc, "_hermes_scope_streams")
+    streams.stderr.close()
+    streams.entered.close()
+
 
 
 def limit_note(returncode: int | None, output: str) -> str:

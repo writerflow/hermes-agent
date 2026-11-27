@@ -79,6 +79,8 @@ class SystemdStub:
                                    'echo "Failed to connect to bus: No such file or directory" >&2; exit 1'),
         # the command did run, and the wrapper still reports failure
         "ran_then_fail": '"${args[@]:$((sep+1))}"; exit 1',
+        "ran_then_bus_error": ('"${args[@]:$((sep+1))}"; '
+                               'echo "Failed to connect to bus: No such file or directory" >&2; exit 1'),
     }
 
     def __init__(self, root: Path, mode: str = "passthrough", *, real: str | None = None):
@@ -534,6 +536,16 @@ class TestScopeLifecycle:
         assert counter.read_text() == "ran\n"
         assert result["returncode"] == 1
         assert result["output"].strip() == diagnostic
+        assert len(stub.calls()) == 1
+
+    def test_launcher_bus_diagnostic_after_payload_does_not_replay(self, worker_host, fg_config,
+                                                                  stub_factory, make_env, tmp_path):
+        fg_config()
+        stub = stub_factory("ran_then_bus_error")
+        counter = tmp_path / "counter"
+        result = make_env().execute(f"echo ran >> {counter}", resource_scope=True)
+        assert counter.read_text() == "ran\n"
+        assert result["returncode"] == 1
         assert len(stub.calls()) == 1
 
     @pytest.mark.parametrize("mode", ["lost_create_reply", "unit_exists", "multiline_create_error"])

@@ -1294,7 +1294,7 @@ class LocalEnvironment(BaseEnvironment):
             return result
         finally:
             if foreground_scope.scope_unit_of(proc):
-                proc._hermes_scope_stderr.close()
+                foreground_scope.close_spawn_streams(proc)
             if (owned_pgid := getattr(proc, "_hermes_owned_pgid", None)) is not None:
                 proc._hermes_owned_pgid = None
                 release_process_groups([owned_pgid])
