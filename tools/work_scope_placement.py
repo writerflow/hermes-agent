@@ -11,13 +11,25 @@ from hermes_constants import get_routing_process_hermes_home
 from utils.files import atomic_write_text
 
 
-def record_background_intent(pid: int, unit: str, session_id: str) -> None:
-    """Record the still-held child's birth and origin before it can call systemd."""
+def _live_child_birth(pid: int) -> int:
     proc = Path(f"/proc/{pid}")
     stat = (proc / "stat").read_text().rsplit(")", 1)[1].split()
     # The private gate's peer must still be our child, not a reused PID.
     if int(stat[1]) != os.getpid() or stat[0] in {"Z", "X"}:
         raise OSError("scope launcher is not a live child")
+    return int(stat[19])
+
+
+def verify_background_birth(pid: int, birth: int) -> None:
+    """Check the held child again after the launcher reports placement."""
+    if _live_child_birth(pid) != birth:
+        raise OSError("scope launcher birth changed before release")
+
+
+def record_background_intent(pid: int, unit: str, session_id: str) -> int:
+    """Persist the held child's origin and return its recorded birth."""
+    proc = Path(f"/proc/{pid}")
+    birth = _live_child_birth(pid)
     origin, = (line[3:] for line in (proc / "cgroup").read_text().splitlines() if line.startswith("0::/"))
     attempt = uuid.uuid4().hex
     data = {
@@ -31,7 +43,7 @@ def record_background_intent(pid: int, unit: str, session_id: str) -> None:
         "pid_namespace": os.readlink(proc / "ns/pid"),
         "uid": proc.stat().st_uid,
         "pid": pid,
-        "start_time": int(stat[19]),
+        "start_time": birth,
         "origin_cgroup": origin,
     }
     home = get_routing_process_hermes_home()
@@ -45,3 +57,4 @@ def record_background_intent(pid: int, unit: str, session_id: str) -> None:
             os.fsync(fd)
         finally:
             os.close(fd)
+    return birth

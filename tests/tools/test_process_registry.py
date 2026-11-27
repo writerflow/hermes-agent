@@ -2020,7 +2020,8 @@ class TestSystemdCgroupIsolation:
         owner.recv.side_effect = [b"P", b"V"]
         launcher.fileno.return_value = 12
         monkeypatch.setattr("tools.process_registry.socket.socketpair", lambda: (owner, launcher))
-        monkeypatch.setattr("tools.process_registry.record_background_intent", lambda *args: None)
+        monkeypatch.setattr("tools.process_registry.record_background_intent", lambda *args: 123)
+        monkeypatch.setattr("tools.process_registry.verify_background_birth", lambda *args: None)
 
     @pytest.mark.platforms("linux")
     def test_wraps_in_systemd_scope_when_supervisor_and_available(
