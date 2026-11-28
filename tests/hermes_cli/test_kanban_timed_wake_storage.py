@@ -10,7 +10,10 @@ import pytest
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_transfer as kt
-from tests.hermes_cli._timed_wake_support import FUTURE, board, park, wake_rows
+from tests.hermes_cli._timed_wake_support import FUTURE, park, wake_rows
+from tests.hermes_cli import _timed_wake_support as _support
+
+board = _support.board  # re-exported pytest fixture
 
 
 @pytest.mark.parametrize(

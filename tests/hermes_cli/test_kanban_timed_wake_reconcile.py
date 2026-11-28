@@ -12,8 +12,11 @@ from hermes_cli import kanban_db_dispatch as kbd
 from hermes_cli import kanban_db_wakes as wakes
 from hermes_cli import kanban_control
 from tests.hermes_cli._timed_wake_support import (
-    DUE, FUTURE, NOW, action_generations, board, events, park, task_columns, tick, wake_rows,
+    DUE, FUTURE, NOW, action_generations, events, park, task_columns, tick, wake_rows,
 )
+from tests.hermes_cli import _timed_wake_support as _support
+
+board = _support.board  # re-exported pytest fixture
 
 
 def test_due_wake_becomes_due_held_with_one_event_and_card_stays_scheduled(board):

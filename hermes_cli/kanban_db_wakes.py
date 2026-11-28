@@ -19,7 +19,7 @@ import os
 import re
 import sqlite3
 import time
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, field, fields
 from datetime import datetime, timedelta, timezone, UTC
 from typing import Any, Optional
 
@@ -122,7 +122,7 @@ def operator_context() -> bool:
     try:
         from agent import delegation_context
         return not delegation_context.is_delegated_child_process_context()
-    except Exception:  # fail closed: an unreadable context is not an operator
+    except (ImportError, AttributeError):  # fail closed: an unreadable context is not an operator
         return False
 
 
@@ -132,7 +132,7 @@ def may_arm(task_id: str) -> bool:
         from agent.delegation_context import owned_kanban_task
         if task_id and owned_kanban_task() == task_id:
             return True
-    except Exception:
+    except (ImportError, AttributeError):  # fail closed: an unreadable context may not arm
         return False
     return operator_context()
 
@@ -536,7 +536,7 @@ def _due_pass(conn, report, *, now, dry_run, due_limit, result) -> None:
                 ).fetchone()
                 _bucket(report, "due_held" if state and state[0] == "due_held" else "superseded"
                         ).append(wake_id)
-        except Exception:
+        except Exception:  # health: allow BLE001 -- one bad wake row never blocks the others; logged with traceback
             result.wait_reconcile_errors += 1
             _log.warning("timed wake %s: due action failed; it stays armed", wake_id, exc_info=True)
 
@@ -556,7 +556,7 @@ def _invalid_pass(conn, report, *, dry_run, due_limit, result) -> None:
                 row["task_id"], DISPATCHER_SCOPE, f"wake-invalid:{row['wake_id']}:bad_wake_at",
                 row["wake_id"], "bad_wake_at",
             ))
-        except Exception:
+        except Exception:  # health: allow BLE001 -- one bad wake row never blocks the others; logged with traceback
             result.wait_reconcile_errors += 1
             _log.warning("timed wake %s: invalid-row report failed", row["wake_id"], exc_info=True)
 
@@ -578,7 +578,7 @@ def _sweep(conn, report, *, sweep_limit, result) -> None:
             ))
             if outcome.committed:
                 _bucket(report, "superseded").append(wake_id)
-        except Exception:
+        except Exception:  # health: allow BLE001 -- one bad wake row never blocks the others; logged with traceback
             result.wait_reconcile_errors += 1
             _log.warning("timed wake %s: supersede failed", row["wake_id"], exc_info=True)
 
@@ -627,11 +627,25 @@ def reconcile_timed_wakes(
 
 # --------------------------------------------------------------- reports
 
+@dataclass
+class WakeResultFields:
+    """Timed-wake report carried on ``DispatchResult``; ``due_held`` ids mean "due, release held"."""
+
+    wakes: dict = field(default_factory=dict)
+    wait_reconcile_errors: int = 0
+
+
+def wake_suppression_counts(result) -> dict:
+    """``{"wake_due_held": N}`` for ``describe_suppression`` when a tick held due wakes."""
+    held = result.wakes.get("due_held")
+    return {"wake_due_held": len(held)} if held else {}
+
+
 def reconcile_typed_waits(conn: sqlite3.Connection, result, *, dry_run: bool = False) -> None:
     """Dispatcher-tick entry point for typed waits; a failure never stops the tick."""
     try:
         reconcile_timed_wakes(conn, result, dry_run=dry_run)
-    except Exception:
+    except Exception:  # health: allow BLE001 -- typed waits never stop the dispatcher tick; logged with traceback
         result.wait_reconcile_errors += 1
         _log.warning("typed wait reconcile failed; the tick continues", exc_info=True)
 

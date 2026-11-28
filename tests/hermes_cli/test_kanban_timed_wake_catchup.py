@@ -12,8 +12,11 @@ from hermes_cli import kanban_db_dispatch as kbd
 from hermes_cli import kanban_db_task_state as task_state
 from hermes_cli import kanban_db_wakes as wakes
 from tests.hermes_cli._timed_wake_support import (
-    DUE, NOW, board, events, park, tick, wake_rows,
+    DUE, NOW, events, park, tick, wake_rows,
 )
+from tests.hermes_cli import _timed_wake_support as _support
+
+board = _support.board  # re-exported pytest fixture
 
 # The terminal action of Part A is ``due_held``; Part B ("released") is held on the WRI-2631 contract.
 TERMINAL = "due_held"

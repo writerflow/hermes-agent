@@ -29,6 +29,7 @@ from typing import Optional
 from typing import TYPE_CHECKING
 
 from hermes_cli.quiet_single_query import KANBAN_WORKER_EXIT_TRAILER
+from hermes_cli.kanban_db_wakes import WakeResultFields, wake_suppression_counts
 from hermes_cli._startup_fast import project_root_str
 from hermes_cli.kanban_dispatch_recovery.storage import (
     reconcile_pending_runtime_timeouts as _reconcile_pending_runtime_timeouts,
@@ -101,7 +102,7 @@ class DispatchDecision:
 
 
 @dataclass
-class DispatchResult:
+class DispatchResult(WakeResultFields):
     """Outcome of a single ``dispatch`` pass.
 
     ``kanban.default_assignee`` applied this tick before spawning (#27145). Surfaces the auto-assignment to
@@ -117,9 +118,6 @@ class DispatchResult:
 
     reclaimed: int = 0
     promoted: int = 0
-    wakes: dict = field(default_factory=dict)
-    """Typed timed-wake report: ``due_held`` ids are "due, release held" (Part A never releases)."""
-    wait_reconcile_errors: int = 0
     reconciled_orphans: list[str] = field(default_factory=list)
     """``running`` cards requeued by :func:`reconcile_orphaned_running` (broken
     claim bookkeeping, dead/gone worker)."""
@@ -211,13 +209,10 @@ def describe_suppression(results: Iterable[Optional[DispatchResult]]) -> str:
             counts["rate_limited"] = counts.get("rate_limited", 0) + len(res.rate_limited)
         if res.skipped_locked:
             counts["skipped_locked"] = counts.get("skipped_locked", 0) + 1
-        if res.wakes.get("due_held"):
-            counts["wake_due_held"] = counts.get("wake_due_held", 0) + len(res.wakes["due_held"])
+        counts.update(wake_suppression_counts(res))
         if res.memory_pressure:
             pressure = res.memory_pressure
-    parts = [f"{k}={v}" for k, v in sorted(counts.items())]
-    if pressure:
-        parts.append(f"memory_pressure={pressure}")
+    parts = [f"{k}={v}" for k, v in sorted(counts.items())] + ([f"memory_pressure={pressure}"] if pressure else [])
     return ", ".join(parts)
 
 

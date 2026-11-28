@@ -12,8 +12,11 @@ from hermes_cli import kanban as kc
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_wakes as wakes
 from tests.hermes_cli._timed_wake_support import (
-    FUTURE, NOW, action_generations, board, events, park, task_columns, tick, wake_rows,
+    FUTURE, NOW, action_generations, events, park, task_columns, tick, wake_rows,
 )
+from tests.hermes_cli import _timed_wake_support as _support
+
+board = _support.board  # re-exported pytest fixture
 
 
 def _legacy(conn, title="legacy", marker="SCHEDULED_UNTIL=2026-01-01T00:00:00Z"):
