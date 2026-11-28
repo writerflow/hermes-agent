@@ -168,17 +168,17 @@ def test_unknown_block_identity_holds(board):
 
 def test_classification_rerun_inside_transaction(board, monkeypatch):
     task_id = park(board)
-    original = wakes._due_pass
+    original = wakes._run
 
-    def hold_after_read(conn, report, **kw):
-        # The tick has read its candidate rows; a hold lands before the kernel op runs.
-        rows = conn.execute("SELECT * FROM task_wakes WHERE state = 'armed'").fetchall()
-        assert rows
-        conn.execute("UPDATE tasks SET claim_lock = 'late', claim_expires = ? WHERE id = ?", (NOW + 600, task_id))
-        conn.commit()
-        return original(conn, report, **kw)
+    def hold_then_run(conn, request):
+        # The due pass has selected the row; a hold lands just before the kernel op.
+        if isinstance(request, wakes.WakeDueRequest):
+            conn.execute("UPDATE tasks SET claim_lock = 'late', claim_expires = ? WHERE id = ?",
+                         (NOW + 600, task_id))
+            conn.commit()
+        return original(conn, request)
 
-    monkeypatch.setattr(wakes, "_due_pass", hold_after_read)
+    monkeypatch.setattr(wakes, "_run", hold_then_run)
 
     tick(board)
 

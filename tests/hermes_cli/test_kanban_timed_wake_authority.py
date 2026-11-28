@@ -127,6 +127,40 @@ def test_tool_refuses_wake_on_another_card_when_variable_is_inherited_by_cron(wo
     assert out.get("error") and _rows() == []
 
 
+def _ready_sibling():
+    with kbc.connect_closing() as conn:
+        return kb.create_task(conn, title="schedulable sibling", assignee="peer")
+
+
+def _status_and_rows(task_id):
+    with kbc.connect_closing() as conn:
+        return kb.get_task(conn, task_id).status, len(_rows())
+
+
+def test_tool_inherited_variable_cannot_arm_schedulable_sibling(worker, monkeypatch):
+    # RA3: the sibling is ready, so only the arm predicate can refuse it (a Scheduled one is
+    # refused by schedule_task regardless).
+    from tools import kanban_tools as kt
+
+    monkeypatch.setattr(delegation_context, "is_dispatcher_owned_worker_context", lambda: False)
+    sibling = _ready_sibling()
+
+    out = json.loads(kt._handle_schedule({"task_id": sibling, "reason": "x", "wake_at": _future()}))
+
+    assert out.get("error")
+    assert _status_and_rows(sibling) == ("ready", 0)
+
+
+def test_cli_schedule_inherited_variable_cannot_arm_schedulable_sibling(worker, monkeypatch):
+    monkeypatch.setattr(delegation_context, "is_dispatcher_owned_worker_context", lambda: False)
+    sibling = _ready_sibling()
+
+    rc = kc._cmd_schedule(argparse.Namespace(task_id=sibling, reason=["x"], ids=None, wake_at=_future()))
+
+    assert rc != 0
+    assert _status_and_rows(sibling) == ("ready", 0)
+
+
 # --------------------------------------------------------------------- CLI
 
 def test_cli_schedule_wake_at_flag(home):
