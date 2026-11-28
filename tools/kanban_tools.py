@@ -907,10 +907,22 @@ def _handle_schedule(args: dict, **kw) -> str:
                "goal_mode tasks cannot be scheduled: use kanban_block with kind "
                f"in {sorted(_GOAL_MODE_BLOCK_ALLOWED_KINDS)} for a genuine external "
                "blocker, or kanban_complete so the completion judge can evaluate it.")
-        ok = kb.schedule_task(
-            conn, tid, reason=reason, expected_run_id=_worker_run_id(tid))
-        _check(ok, f"could not schedule {tid} (unknown id or not in todo/ready/running/blocked)")
-        return _ok_landed(kb, conn, tid, "scheduled", reason=reason)
+        wake_at = args.get("wake_at")
+        if wake_at is not None:
+            from hermes_cli import kanban_db_wakes as wakes
+            _check(wakes.may_arm(tid), "wake_at on a card you do not own needs an operator "
+                   "context: HERMES_KANBAN_TASK unset and not a delegate_task child. Ask via "
+                   "kanban_comment; an operator runs `hermes kanban wake`.")
+        try:
+            ok = kb.schedule_task(
+                conn, tid, reason=reason, expected_run_id=_worker_run_id(tid), wake_at=wake_at)
+        except ValueError as exc:  # WakeInputError: stable code, the board is untouched
+            raise _Reject(f"wake_at refused: {getattr(exc, 'code', exc)}") from None
+        _check(ok, f"could not schedule {tid} (unknown id or not in todo/ready/running/blocked"
+                   + ("; a wake_at is also refused while a needs_input/capability/creator hold "
+                      "is outstanding" if wake_at is not None else "") + ")")
+        return _ok_landed(kb, conn, tid, "scheduled", reason=reason,
+                          **({"wake_at": wake_at} if wake_at is not None else {}))
 
 
 @_kanban_handler("kanban_request_review")

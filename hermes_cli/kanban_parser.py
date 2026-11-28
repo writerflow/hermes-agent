@@ -340,7 +340,22 @@ _SPECS = [
         _TASK_ID,
         _arg("reason", nargs="*", help="Reason/timing note (also appended as a comment)"),
         _bulk_ids("schedule"),
+        _arg("--wake-at", dest="wake_at",
+             help="Typed wake time, YYYY-MM-DDTHH:MM[:SS] with Z or ±HH:MM. Part A detects "
+                  "a due wake and holds; it does not release the card."),
     ], help="Park one or more tasks in Scheduled (waiting on time, not human input)"),
+    _cmd("wake", [
+        _TASK_ID,
+        _arg("--at", required=True, help="Wake time, YYYY-MM-DDTHH:MM[:SS] with Z or ±HH:MM"),
+        _arg("--expect-park", dest="expect_park", type=int,
+             help="Refuse unless this is the card's newest scheduled event id"),
+    ], help="Arm a typed wake on an already-Scheduled card (operator context only)"),
+    _cmd("wakes", [
+        _arg("--state", choices=["armed", "due_held", "release_unknown", "released", "superseded"]),
+        _arg("--legacy", action="store_true",
+             help="List Scheduled cards with a SCHEDULED_UNTIL= reason and no typed wake"),
+        _arg("--json", dest="json", action="store_true", help="Emit machine-readable JSON"),
+    ], help="Report typed wakes (read-only)"),
     _cmd("unblock", [
         _reason("Optional reason/note — recorded as a comment before unblocking. Quote multi-word reasons."),
         _TASK_IDS,

@@ -117,6 +117,9 @@ class DispatchResult:
 
     reclaimed: int = 0
     promoted: int = 0
+    wakes: dict = field(default_factory=dict)
+    """Typed timed-wake report: ``due_held`` ids are "due, release held" (Part A never releases)."""
+    wait_reconcile_errors: int = 0
     reconciled_orphans: list[str] = field(default_factory=list)
     """``running`` cards requeued by :func:`reconcile_orphaned_running` (broken
     claim bookkeeping, dead/gone worker)."""
@@ -208,6 +211,8 @@ def describe_suppression(results: Iterable[Optional[DispatchResult]]) -> str:
             counts["rate_limited"] = counts.get("rate_limited", 0) + len(res.rate_limited)
         if res.skipped_locked:
             counts["skipped_locked"] = counts.get("skipped_locked", 0) + 1
+        if res.wakes.get("due_held"):
+            counts["wake_due_held"] = counts.get("wake_due_held", 0) + len(res.wakes["due_held"])
         if res.memory_pressure:
             pressure = res.memory_pressure
     parts = [f"{k}={v}" for k, v in sorted(counts.items())]

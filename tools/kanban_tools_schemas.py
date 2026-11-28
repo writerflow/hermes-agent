@@ -209,15 +209,20 @@ KANBAN_SCHEDULE_SCHEMA = _schema(
     "kanban_schedule",
     (
         "Park your task as 'scheduled' while it waits for a time or external event. This ends the current run and makes the "
-        "task non-dispatchable until an orchestrator unblocks it; it does not "
-        "create a timer. Put any wake-up marker such as "
-        "``SCHEDULED_UNTIL=<ISO8601>`` in ``reason``."
+        "task non-dispatchable until an orchestrator unblocks it. Plain text such as "
+        "``SCHEDULED_UNTIL=<ISO8601>`` in ``reason`` does nothing. A typed ``wake_at`` records a wake "
+        "time that the dispatcher detects when due; it does not release the card yet, because a "
+        "timed release needs the guarded-release primitive. Use it only on your own card."
     ),
     {
         "task_id": _prop("string", _DESC_TASK_ID_DEFAULT),
         "reason": _prop("string", (
-            "Optional reason or machine-readable wake-up marker recorded on "
-            "the completed run and scheduled event."
+            "Optional reason recorded on the completed run and scheduled event."
+        )),
+        "wake_at": _prop("string", (
+            "Optional typed wake time: YYYY-MM-DDTHH:MM[:SS] followed by Z or ±HH:MM. "
+            "Naive times, zone names, past times and times over 366 days ahead are refused "
+            "and nothing is parked."
         )),
     },
     [],

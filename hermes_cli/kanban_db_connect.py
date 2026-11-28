@@ -379,8 +379,9 @@ def _protected_connection(path: str | Path, *, operation: str):
     writable_tables = {
         "block": {
             "tasks", "task_runs", "task_events", "task_transition_receipts",
-            "kanban_claim_admissions", "kanban_writer_faults",
+            "kanban_claim_admissions", "kanban_writer_faults", "task_wakes",
         },
+        "wake": {"tasks", "task_events", "task_transition_receipts", "task_wakes", "kanban_writer_faults"},
         "classify_block": {
             "tasks", "task_events", "task_transition_receipts",
             "kanban_claim_admissions", "kanban_writer_faults",
@@ -1416,6 +1417,8 @@ def _migrate_add_optional_columns(
 
     # Same ordering rule as the ``tasks`` indexes above: index after column.
     conn.execute("CREATE INDEX IF NOT EXISTS idx_events_run ON task_events(run_id, id)")
+    from hermes_cli.kanban_db_wakes import ensure_schema as _ensure_wake_schema
+    _ensure_wake_schema(conn)
 
     if _table_exists(conn, "kanban_notify_subs"):
         notify_cols = _column_names(conn, "kanban_notify_subs")
