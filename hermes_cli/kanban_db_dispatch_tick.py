@@ -51,6 +51,7 @@ def _run_reclaim_phase(
     failure_limit: int,
     reconcile_orphans: bool,
     board: Optional[str] = None,
+    dry_run: bool = False,
 ) -> None:
     """Reclaim stale/orphaned/crashed/timed-out running tasks, then promote."""
     _dispatch.reap_worker_zombies()
@@ -70,6 +71,9 @@ def _run_reclaim_phase(
     )
     result.timed_out = _dispatch.enforce_max_runtime(conn)
     result.promoted = _kb.recompute_ready(conn, failure_limit=failure_limit)
+    from hermes_cli import kanban_db_wakes as _wakes
+
+    _wakes.reconcile_typed_waits(conn, result, dry_run=dry_run)
 
 
 def _tick_spawn_budget(
@@ -184,6 +188,7 @@ def _dispatch_once_locked(
         _dispatch._run_reclaim_phase(
             conn, result, stale_timeout_seconds=stale_timeout_seconds,
             failure_limit=failure_limit, reconcile_orphans=reconcile_orphans, board=board,
+            dry_run=dry_run,
         )
     _raise_if_control_held(conn, result, control_hold)
     may_spawn, spawn_budget = _dispatch._tick_spawn_budget(

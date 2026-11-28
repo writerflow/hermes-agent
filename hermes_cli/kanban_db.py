@@ -3179,14 +3179,12 @@ def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
 
 def schedule_task(
     conn: sqlite3.Connection, task_id: str, *, reason: Optional[str] = None,
-    expected_run_id: Optional[int] = None,
+    expected_run_id: Optional[int] = None, wake_at: Optional[str] = None,
 ) -> bool:
     """Compatibility entrypoint for receipt-backed scheduling transitions."""
     from hermes_cli.kanban_db_task_state import schedule_task as _schedule
 
-    return _schedule(
-        conn, task_id, reason=reason, expected_run_id=expected_run_id
-    )
+    return _schedule(conn, task_id, reason=reason, expected_run_id=expected_run_id, wake_at=wake_at)
 
 
 # --- Worker context builder (what a spawned worker sees) ---

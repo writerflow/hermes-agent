@@ -29,6 +29,7 @@ from typing import Optional
 from typing import TYPE_CHECKING
 
 from hermes_cli.quiet_single_query import KANBAN_WORKER_EXIT_TRAILER
+from hermes_cli.kanban_db_wakes import WakeResultFields, wake_suppression_counts
 from hermes_cli._startup_fast import project_root_str
 from hermes_cli.kanban_dispatch_recovery.storage import (
     reconcile_pending_runtime_timeouts as _reconcile_pending_runtime_timeouts,
@@ -101,7 +102,7 @@ class DispatchDecision:
 
 
 @dataclass
-class DispatchResult:
+class DispatchResult(WakeResultFields):
     """Outcome of a single ``dispatch`` pass.
 
     ``kanban.default_assignee`` applied this tick before spawning (#27145). Surfaces the auto-assignment to
@@ -208,11 +209,10 @@ def describe_suppression(results: Iterable[Optional[DispatchResult]]) -> str:
             counts["rate_limited"] = counts.get("rate_limited", 0) + len(res.rate_limited)
         if res.skipped_locked:
             counts["skipped_locked"] = counts.get("skipped_locked", 0) + 1
+        counts.update(wake_suppression_counts(res))
         if res.memory_pressure:
             pressure = res.memory_pressure
-    parts = [f"{k}={v}" for k, v in sorted(counts.items())]
-    if pressure:
-        parts.append(f"memory_pressure={pressure}")
+    parts = [f"{k}={v}" for k, v in sorted(counts.items())] + ([f"memory_pressure={pressure}"] if pressure else [])
     return ", ".join(parts)
 
 

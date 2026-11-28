@@ -31,6 +31,7 @@ from hermes_cli.kanban_output import (
 from hermes_cli.kanban_boards import _dispatch_boards
 from hermes_cli.kanban_claim_cli import _cmd_claim
 from hermes_cli.kanban_control_cli import _cmd_pause, _cmd_pause_status, _cmd_resume
+from hermes_cli.kanban_wake_cli import _cmd_wake, _cmd_wakes
 from hermes_cli.kanban_ops import (
     _cmd_daemon, _kanban_config, _cmd_dispatch, _cmd_gc, _cmd_repair, _cmd_tail, _cmd_watch,
 )
@@ -210,7 +211,7 @@ def _profile_author() -> str:
 _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "init", "create", "swarm", "assign", "reclaim", "reassign", "link", "unlink",
     "claim", "comment", "attach", "attach-rm", "complete", "edit", "block",
-    "schedule", "unblock", "promote", "archive", "dispatch", "daemon", "repair",
+    "schedule", "unblock", "wake", "promote", "archive", "dispatch", "daemon", "repair",
     "heartbeat", "notify-subscribe", "notify-unsubscribe", "specify", "decompose",
     "request-review", "request-changes", "reopen-review",
     "gc",
@@ -1038,9 +1039,19 @@ def _cmd_schedule(args: argparse.Namespace) -> int:
     author = _profile_author()
     ids = _bulk_ids(args)
     suffix = f": {reason}" if reason else ""
+    wake_at = getattr(args, "wake_at", None)
+    if wake_at is not None:
+        from hermes_cli import kanban_db_wakes as wakes
+        try:
+            wakes.parse_wake_at(wake_at, now=int(time.time()))
+        except wakes.WakeInputError as exc:
+            return _err(f"wake_at refused: {exc.code}")
+        if not all(wakes.may_arm(tid) for tid in ids):
+            return _err("--wake-at on a card you do not own needs an operator context "
+                        "(HERMES_KANBAN_TASK unset, not a delegate_task child)")
     with kbc.connect_closing() as conn:
         op = _commented(conn, reason, author, "SCHEDULED", lambda tid: kb.schedule_task(
-            conn, tid, reason=reason, expected_run_id=_worker_run_id_for(tid)))
+            conn, tid, reason=reason, expected_run_id=_worker_run_id_for(tid), wake_at=wake_at))
         return _bulk_apply(ids, op, lambda tid: f"Scheduled {tid}{suffix}", lambda tid: f"cannot schedule {tid}")
 
 
@@ -1385,7 +1396,7 @@ _HANDLERS = {
     "assignees": _cmd_assignees, "notify-subscribe": _cmd_notify_subscribe,
     "notify-list": _cmd_notify_list, "notify-unsubscribe": _cmd_notify_unsubscribe,
     "context": _cmd_context, "specify": _cmd_specify, "decompose": _cmd_decompose,
-    "gc": _cmd_gc,
+    "gc": _cmd_gc, "wake": _cmd_wake, "wakes": _cmd_wakes,
 }
 
 

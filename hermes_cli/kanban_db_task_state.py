@@ -23,6 +23,7 @@ from hermes_cli.kanban_dispatch_recovery import dead_worker as _dead_recovery
 from hermes_cli.kanban_state_operations import authenticated_action as _authenticated
 from hermes_cli.kanban_state_operations import direct_status as _direct_status
 from hermes_cli.kanban_state_operations import edit_fields as _edit_fields
+from hermes_cli import kanban_db_wakes as _wakes
 
 _TUPLE_VERSION = 1
 _OPERATION_VERSION = 1
@@ -175,6 +176,8 @@ class _ScheduleRequest:
     operation_id: str
     reason: Optional[str]
     expected_run_id: Optional[int]
+    wake_at: Optional[int] = None
+    wake_input: Optional[str] = None
     operation_kind: str = "schedule"
     authority_kind: str = "block"
 
@@ -497,6 +500,7 @@ def _schedule_request_hash(request: _ScheduleRequest) -> str:
         "actor_scope": request.actor_scope,
         "reason": request.reason,
         "expected_run_id": request.expected_run_id,
+        **_wakes.schedule_hash_fields(request),
     })
 
 
@@ -598,6 +602,7 @@ _REQUEST_HASHERS = {
     _recovery.StaleRunningRequest: _create_request_hash,
     _recovery.OrphanRunningRequest: _create_request_hash,
     _dead_recovery.DeadWorkerRequest: _create_request_hash,
+    **_wakes.REQUEST_HASHERS,
 }
 
 
@@ -704,7 +709,7 @@ def _insert_receipt(
     result_tuple_hash = _protected_tuple_hash(
         private,
         request.task_id,
-        allow_deleted=isinstance(request, _DeleteRequest),
+        allow_deleted=isinstance(request, (_DeleteRequest, _wakes.WakeSupersedeRequest, _wakes.WakeDueRequest)),
     )
     private.execute(
         "INSERT INTO task_transition_receipts "
@@ -1130,7 +1135,7 @@ def _apply_schedule(
         private,
         request.task_id,
         "scheduled",
-        {"reason": request.reason},
+        _wakes.scheduled_payload(request),
         run_id=run_id,
     )
     event_id = private.execute("SELECT last_insert_rowid()").fetchone()[0]
@@ -1510,7 +1515,7 @@ _OPERATION_HANDLERS = {
     _ClassifyBlockRequest: _apply_classify_block,
     _UnblockRequest: _apply_unblock,
     _PromoteRequest: _apply_promote,
-    _ScheduleRequest: _apply_schedule,
+    _ScheduleRequest: _wakes.apply_schedule,
     _ArchiveRequest: _apply_archive,
     _DeleteRequest: _apply_delete,
     _LinkRequest: _apply_link,
@@ -1530,6 +1535,7 @@ _OPERATION_HANDLERS = {
     _recovery.StaleRunningRequest: _recovery._apply_stale_running,
     _recovery.OrphanRunningRequest: _recovery._apply_orphan_running,
     _dead_recovery.DeadWorkerRequest: _dead_recovery._apply_dead_worker,
+    **_wakes.HANDLERS,
 }
 
 
@@ -1744,10 +1750,12 @@ def schedule_task_transition(
     operation_id: str,
     reason: Optional[str] = None,
     expected_run_id: Optional[int] = None,
+    wake_at: Optional[int] = None,
+    wake_input: Optional[str] = None,
 ) -> TransitionOutcome:
-    """Park one eligible task through the replay-safe receipt kernel."""
+    """Park one eligible task; ``wake_at`` (validated epoch) arms a typed wake in the same txn."""
     request = _ScheduleRequest(
-        task_id, actor_scope, operation_id, reason, expected_run_id
+        task_id, actor_scope, operation_id, reason, expected_run_id, wake_at, wake_input
     )
     return _run_operation(conn, request).outcome
 
@@ -1758,8 +1766,10 @@ def schedule_task(
     *,
     reason: Optional[str] = None,
     expected_run_id: Optional[int] = None,
+    wake_at: Optional[str] = None,
 ) -> bool:
     """Compatibility adapter preserving the literal-bool schedule result."""
+    wake = None if wake_at is None else _wakes.parse_wake_at(wake_at, now=int(time.time()))
     return schedule_task_transition(
         conn,
         task_id,
@@ -1767,6 +1777,7 @@ def schedule_task(
         operation_id=_compatibility_lifecycle_operation_id("schedule", task_id),
         reason=reason,
         expected_run_id=expected_run_id,
+        wake_at=wake and wake.epoch, wake_input=wake and wake.text,
     ).committed
 
 
